@@ -1,0 +1,18 @@
+{
+  "expected_changes": [
+    {
+      "element": "focal_wall",
+      "type": "painted",
+      "sku": "blue_paint",
+      "delta_area_m2": 5.0,
+      "delta_fraction": 0.5
+    },
+    {
+      "element": "floor",
+      "type": "tiles_laid",
+      "sku": "ceramic_tile_30cm",
+      "delta_count": 25,
+      "delta_area_m2": 2.25
+    }
+  ]
+}

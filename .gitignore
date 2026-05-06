@@ -1,0 +1,39 @@
+# env
+.venv/
+__pycache__/
+*.pyc
+.python-version
+
+# data — usually too large for git
+data/visit_*/raw*
+data/visit_*/frames/
+data/visit_*/*.mp4
+data/visit_*/*.mov
+data/visit_*/*.MP4
+data/visit_*/*.MOV
+
+# local sqlite db (contains user auth records)
+data/index.db
+
+# absolute-path symlinks into local visit_*/outputs dirs
+data/projects/*/captures/*/frames
+data/projects/*/captures/*/outputs
+
+# python build artifacts
+*.egg-info/
+
+# model weights
+models/*.pt
+models/*.pth
+models/*.bin
+models/*.safetensors
+models/*.ckpt
+
+# generated outputs
+outputs/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp

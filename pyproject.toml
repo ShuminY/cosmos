@@ -1,0 +1,60 @@
+[project]
+name = "cosmos-poc"
+version = "0.0.1"
+description = "Construction progress monitoring — reconstruct rooms, diff between visits, quantify changes"
+requires-python = ">=3.10,<3.13"
+
+dependencies = [
+    # Core scientific
+    "numpy>=1.26,<2.0",          # 1.x for compatibility with most CV libs
+    "scipy>=1.11",
+    "pillow>=10.0",
+    "opencv-python>=4.9",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+
+    # Deep learning (MPS-capable on Apple Silicon)
+    "torch>=2.3",
+    "torchvision>=0.18",
+    "transformers>=4.40",
+    "huggingface-hub>=0.23",
+    "timm>=1.0",                 # used by DINOv2 / Grounding DINO
+
+    # 3D / point clouds
+    "open3d>=0.18",
+    "trimesh>=4.3",
+
+    # Segmentation
+    # SAM 2 — install from git in install step (no PyPI release at time of writing)
+    # Grounding DINO — from git
+    "supervision>=0.20",         # mask viz / annotations
+
+    # Reporting / glue
+    "pydantic>=2.7",
+    "rich>=13.7",
+    "typer>=0.12",
+
+    # UI
+    "streamlit>=1.40",
+    "plotly>=5.20",
+
+    # Multi-tenant phase: auth, DB, document analyzers
+    "sqlalchemy>=2.0",
+    "bcrypt>=4.1",
+    "pypdf>=4.0",
+    "python-docx>=1.1",
+    "python-pptx>=1.0",
+    "openpyxl>=3.1",
+    "pandas>=2.2",
+    "ifcopenshell>=0.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel",
+    "jupyter",
+    "matplotlib",
+]
+
+[tool.uv]
+# CPU/MPS only — no CUDA wheels on macOS anyway

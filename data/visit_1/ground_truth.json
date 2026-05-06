@@ -1,0 +1,26 @@
+{
+  "visit": 1,
+  "wall": {
+    "total_area_m2": 10.0,
+    "painted_fraction": 0.0,
+    "painted_area_m2": 0.0,
+    "paint_color_name": null
+  },
+  "floor": {
+    "total_area_m2": 16.0,
+    "tile_count": 0,
+    "tile_size_m": 0.3,
+    "tiled_area_m2": 0.0,
+    "tile_sku": null
+  },
+  "aruco": {
+    "dict": "DICT_4X4_50",
+    "id": 23,
+    "size_m": 0.2
+  },
+  "room_dims_m": {
+    "W": 4.0,
+    "D": 4.0,
+    "H": 2.5
+  }
+}
