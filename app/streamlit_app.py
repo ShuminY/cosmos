@@ -34,6 +34,7 @@ from views import (
     view_projects, view_project_detail,
     current_user, is_admin, require_login,
 )
+from views_kb import view_knowledge_base, view_chatbot, view_llm_settings
 from src.db import init_db
 init_db()
 
@@ -152,12 +153,13 @@ st.sidebar.divider()
 
 nav_groups = {
     "📂 Projects": ["Projects"],
+    "💡 智能问答": ["知识库", "智能问答"],
     "🧪 Demo data": ["Overview", "Upload", "Visits", "World model", "Segments",
                      "Matches (HITL)", "References", "Change report"],
     "👤 Account": ["Profile"],
 }
 if is_admin():
-    nav_groups["🛠 Admin"] = ["Users"]
+    nav_groups["🛠 Admin"] = ["Users", "LLM 设置"]
 
 # Flatten with group separators in the radio
 flat = []
@@ -646,6 +648,10 @@ PAGES = {
     "Projects": view_projects,
     "Profile": view_profile,
     "Users": view_admin_users,
+    "LLM 设置": view_llm_settings,
+    # Knowledge Base
+    "知识库": view_knowledge_base,
+    "智能问答": view_chatbot,
     # Demo data (preserved as a reference of what the pipeline produces)
     "Overview": page_overview,
     "Upload": page_upload,

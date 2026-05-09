@@ -1,4 +1,4 @@
-"""SQLite schema for users / projects / documents / captures / materials / analyses.
+"""SQLite schema for users / projects / documents / captures / materials / analyses / KB chat.
 
 Single import surface — `from src.db import init_db, session, User, Project, ...`
 """
@@ -62,6 +62,8 @@ class Project(Base):
                              cascade="all, delete-orphan")
     analyses = relationship("Analysis", back_populates="project",
                             cascade="all, delete-orphan")
+    chat_sessions = relationship("ChatSession", back_populates="project",
+                                 cascade="all, delete-orphan")
 
 
 class ProjectMember(Base):
@@ -137,7 +139,60 @@ class Document(Base):
     analysis_error = Column(Text, nullable=True)
     analyzed_at = Column(DateTime, nullable=True)
 
+    # Knowledge Base (KB) indexing state
+    kb_status = Column(String(32), nullable=False, default="pending")
+    # 'pending' | 'indexing' | 'indexed' | 'failed'
+    kb_indexed_at = Column(DateTime, nullable=True)
+    kb_error = Column(Text, nullable=True)
+    kb_chunk_count = Column(Integer, nullable=True)
+
     project = relationship("Project", back_populates="documents")
+
+
+class DocumentChunk(Base):
+    """Vectorized text chunk from a document for RAG retrieval."""
+    __tablename__ = "document_chunks"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    document_id = Column(Integer, ForeignKey("documents.id"), nullable=False, index=True)
+    chunk_index = Column(Integer, nullable=False)  # Order within document
+    text = Column(Text, nullable=False)
+    embedding = Column(String, nullable=False)  # JSON-serialized numpy array
+    page_num = Column(Integer, nullable=True)    # For PDFs, PPTX, etc.
+    char_start = Column(Integer, nullable=True)
+    char_end = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    document = relationship("Document")
+
+
+class ChatSession(Base):
+    """Persisted chat conversation for the KB chatbot."""
+    __tablename__ = "chat_sessions"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title = Column(String(255), nullable=True)  # Auto-generated from first message
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    messages = relationship("ChatMessage", back_populates="session",
+                            cascade="all, delete-orphan")
+    project = relationship("Project")
+    user = relationship("User")
+
+
+class ChatMessage(Base):
+    """Individual message in a chat session."""
+    __tablename__ = "chat_messages"
+    id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id"), nullable=False, index=True)
+    role = Column(String(32), nullable=False)  # 'user' | 'assistant'
+    content = Column(Text, nullable=False)
+    context_chunk_ids = Column(Text, nullable=True)  # JSON list of chunk IDs used
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    session = relationship("ChatSession", back_populates="messages")
 
 
 class Analysis(Base):
