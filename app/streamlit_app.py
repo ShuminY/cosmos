@@ -23,8 +23,15 @@ import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
-import open3d as o3d
 import plotly.graph_objects as go
+
+# Optional 3D dependencies
+try:
+    import open3d as o3d
+    OPEN3D_AVAILABLE = True
+except ImportError:
+    OPEN3D_AVAILABLE = False
+    o3d = None
 
 # Local imports for new multi-tenant views
 import sys
@@ -70,6 +77,8 @@ def list_frames(visit: int) -> list[Path]:
 @st.cache_data(show_spinner=False)
 def load_largest_pointcloud(visit: int):
     """Return (xyz, rgb) for the largest sparse PLY of this visit, or (None, None)."""
+    if not OPEN3D_AVAILABLE:
+        return None, None
     sparse = OUTPUTS / f"visit_{visit}" / "sparse"
     if not sparse.exists():
         return None, None

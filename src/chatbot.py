@@ -3,6 +3,7 @@
 Provider registry pattern supports:
 - OpenAI (gpt-3.5-turbo, gpt-4)
 - Qianfan / Baidu (ernie-bot)
+- Volces Ark / 火山方舟 (ark-code-latest, doubao-pro, etc.)
 - Local transformers (TinyLlama, etc.)
 """
 from __future__ import annotations
@@ -36,6 +37,12 @@ _provider_configs: dict[str, dict] = {
     "local": {
         "name": "Local (TinyLlama)",
         "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    },
+    "ark": {
+        "name": "火山方舟 (Volces Ark)",
+        "model": "ep-xxxxxxxx",  # 在控制台创建接入点获取
+        "api_key": "",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
     },
 }
 
@@ -113,17 +120,65 @@ def provider_qianfan(prompt: str, config: dict) -> tuple[str | None, str | None]
 register_provider("qianfan", provider_qianfan)
 
 
-# ============ Local Transformers Provider ============
-def provider_local(prompt: str, config: dict) -> tuple[str | None, str | None]:
-    """Local transformers provider (TinyLlama)."""
-    model_name = config.get("model", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+# ============ Volces Ark Provider ============
+def provider_ark(prompt: str, config: dict) -> tuple[str | None, str | None]:
+    """Volces Ark (火山方舟) API provider.
+    Uses OpenAI-compatible API format.
+    """
+    api_key = config.get("api_key", "")
+    base_url = config.get("base_url", "https://ark.cn-beijing.volces.com/api/v3")
+    model = config.get("model", "ark-code-latest")
+
+    if not api_key:
+        return None, "Ark API key not configured"
 
     try:
-        from transformers import pipeline
-        pipe = pipeline("text-generation", model=model_name)
-        messages = [{"role": "user", "content": prompt}]
-        response = pipe(messages, max_new_tokens=512, temperature=0.3, do_sample=True)
-        return response[0]["generated_text"][-1]["content"], None
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+        )
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1024,
+        )
+        return response.choices[0].message.content, None
+    except ImportError:
+        return None, "openai package not installed"
+    except Exception as e:
+        return None, str(e)
+
+
+register_provider("ark", provider_ark)
+
+
+# ============ Local Transformers Provider ============
+def provider_local(prompt: str, config: dict) -> tuple[str | None, str | None]:
+    """Simple local provider - just returns a mock response for testing."""
+    try:
+        # Extract context from prompt (between "上下文：---" and "---")
+        import re
+        ctx_match = re.search(r'上下文：\n---\n(.*?)\n---', prompt, re.DOTALL)
+        context = ctx_match.group(1) if ctx_match else "无上下文"
+
+        # Extract question
+        q_match = re.search(r'用户问题：(.*?)\n\n回答：', prompt, re.DOTALL)
+        question = q_match.group(1).strip() if q_match else prompt
+
+        response = f"""
+这是基于知识库检索的测试回答。
+
+**您的问题**：{question}
+
+**检索到的上下文摘要**：
+{context[:300]}{'...' if len(context) > 300 else ''}
+
+**说明**：
+这是本地测试模式的模拟回答。如需真实的 LLM 回答，请配置并使用 Qianfan 或 OpenAI 提供商。
+        """
+        return response.strip(), None
     except Exception as e:
         return None, str(e)
 

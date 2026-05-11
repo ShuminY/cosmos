@@ -97,7 +97,7 @@ def view_knowledge_base():
             "文件名": doc.filename,
             "分类": doc.category,
             "KB状态": doc.kb_status,
-            "文本块数": doc.kb_chunk_count or "-",
+            "文本块数": str(doc.kb_chunk_count) if doc.kb_chunk_count else "-",
             "KB索引时间": doc.kb_indexed_at.strftime("%Y-%m-%d %H:%M") if doc.kb_indexed_at else "-",
             "KB错误": doc.kb_error or "-",
             "id": doc.id,
@@ -108,7 +108,7 @@ def view_knowledge_base():
         column_config={
             "id": None,  # Hide
         },
-        use_container_width=True,
+        width="stretch",
     )
 
     # Per-document reindex action
@@ -197,9 +197,9 @@ def view_chatbot():
         st.info("您还没有任何项目。请先创建一个项目并上传文档。")
         return
 
-    # Sidebar: conversation history + project selector
-    with st.sidebar:
-        st.subheader("项目")
+    # Top bar: project selector and provider selector
+    col1, col2, col3 = st.columns([3, 3, 2])
+    with col1:
         project_names = [p.name for p in projects]
         project_idx = st.selectbox(
             "选择项目",
@@ -209,6 +209,7 @@ def view_chatbot():
         )
         project = projects[project_idx]
 
+    with col2:
         # Provider selector
         providers = get_available_providers()
         default_provider = get_default_provider()
@@ -219,29 +220,29 @@ def view_chatbot():
             key="chat_provider_selector",
         )
 
-        st.divider()
-
-        # Conversation history
-        st.subheader("对话历史")
-        sessions = list_chat_sessions(project_id=project.id, user_id=_user_id())
-
-        if st.button("➕ 新对话", type="primary", use_container_width=True):
+    with col3:
+        if st.button("➕ 新对话", type="primary", width="stretch"):
             st.session_state.pop("current_chat_session", None)
             st.rerun()
 
-        selected_session_id = None
-        for sess in sessions:
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                if st.button(sess.title or "新对话", key=f"sess_{sess.id}", use_container_width=True):
-                    st.session_state["current_chat_session"] = sess.id
-                    st.rerun()
-            with col2:
-                if st.button("🗑️", key=f"del_{sess.id}", help="删除对话"):
-                    delete_chat_session(sess.id)
-                    if st.session_state.get("current_chat_session") == sess.id:
-                        st.session_state.pop("current_chat_session", None)
-                    st.rerun()
+    # Session history sidebar (use expander instead)
+    sessions = list_chat_sessions(project_id=project.id, user_id=_user_id())
+    if sessions:
+        with st.expander("📜 对话历史", expanded=False):
+            for sess in sessions:
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    if st.button(sess.title or "新对话", key=f"sess_{sess.id}", width="stretch"):
+                        st.session_state["current_chat_session"] = sess.id
+                        st.rerun()
+                with col2:
+                    if st.button("🗑️", key=f"del_{sess.id}", help="删除对话"):
+                        delete_chat_session(sess.id)
+                        if st.session_state.get("current_chat_session") == sess.id:
+                            st.session_state.pop("current_chat_session", None)
+                        st.rerun()
+
+    st.divider()
 
     # Main chat area
     session_id = st.session_state.get("current_chat_session")
