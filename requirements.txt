@@ -1,0 +1,46 @@
+# Core
+numpy>=1.26,<2.0
+scipy>=1.11
+pillow>=10.0
+
+# Deep Learning
+torch>=2.3
+torchvision>=0.18
+transformers>=4.40
+huggingface-hub>=0.23
+
+# Document Processing
+pypdf>=4.0
+python-docx>=1.1
+python-pptx>=1.0
+openpyxl>=3.1
+pandas>=2.2
+pdf2image
+pytesseract
+
+# OCR Support
+# poppler-utils (system)
+# tesseract-ocr (system)
+
+# Database
+sqlalchemy>=2.0
+bcrypt>=4.1
+
+# UI
+streamlit>=1.40
+plotly>=5.20
+opencv-python>=4.9
+
+# LLM
+openai>=1.0
+
+# Utilities
+pydantic>=2.7
+rich>=13.7
+typer>=0.12
+pyyaml>=6.0
+tqdm>=4.66
+
+# Optional (for advanced features)
+# open3d>=0.18
+# trimesh>=4.3

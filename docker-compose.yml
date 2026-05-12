@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  cosmos:
+    build: .
+    container_name: cosmos-poc
+    ports:
+      - "8501:8501"
+    volumes:
+      # 持久化数据
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+      # 可选：挂载本地代码用于开发
+      # - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
