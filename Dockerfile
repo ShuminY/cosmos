@@ -31,6 +31,7 @@ RUN pip install --no-cache-dir \
     python-pptx \
     openpyxl \
     pandas \
+    ifcopenshell \
     bcrypt \
     opencv-python \
     plotly \

@@ -10,6 +10,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import plotly.graph_objects as go
 import streamlit as st
 from sqlalchemy import select
 
@@ -417,6 +418,7 @@ def _proj_documents(p: Project):
         for d in docs:
             rows_by_cat.setdefault(d.category, []).append({
                 "id": d.id, "filename": d.filename,
+                "path": d.path,
                 "size_kb": round(d.size_bytes / 1024, 1),
                 "status": d.analysis_status,
                 "summary": (d.analysis_summary or "")[:160],
@@ -426,13 +428,28 @@ def _proj_documents(p: Project):
         rows = rows_by_cat.get(key, [])
         if rows:
             with st.expander(f"**{label}** — {len(rows)} file(s)", expanded=True):
-                st.dataframe(rows, use_container_width=True, hide_index=True)
+                st.dataframe(
+                    [{k: v for k, v in r.items() if k != "path"} for r in rows],
+                    use_container_width=True,
+                    hide_index=True,
+                )
                 doc_ids = [r["id"] for r in rows]
                 pick = st.selectbox("Inspect document", doc_ids,
                                     format_func=lambda i: next(r["filename"] for r in rows if r["id"] == i),
                                     key=f"pick_{key}")
-                if pick and st.button("View analysis", key=f"view_{key}"):
-                    _show_doc_detail(pick)
+                picked_row = next((r for r in rows if r["id"] == pick), None)
+                if picked_row:
+                    cols = st.columns(2)
+                    if cols[0].button("View analysis", key=f"view_{key}"):
+                        st.session_state[f"view_doc_{key}"] = pick
+                    if picked_row["status"] == "failed" and cols[1].button("Re-analyze", key=f"reanalyze_{key}"):
+                        _run_doc_analysis(pick, project_dir(p.id) / picked_row["path"])
+                        st.session_state[f"view_doc_{key}"] = pick
+                        st.success(f"Re-analyzed {picked_row['filename']}.")
+                        st.rerun()
+                    viewed_doc_id = st.session_state.get(f"view_doc_{key}")
+                    if viewed_doc_id in doc_ids:
+                        _show_doc_detail(viewed_doc_id)
 
 
 def _save_document_record(*, project_id, category, filename, path, size_bytes, uploaded_by_id) -> int:
@@ -461,12 +478,90 @@ def _run_doc_analysis(doc_id: int, abs_path: Path):
         s.add(d)
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cached_ifc_preview(path_str: str, mtime_ns: int, max_elements: int, max_faces: int) -> dict:
+    try:
+        from src.analyzers.bim import extract_ifc_preview_mesh
+
+        return extract_ifc_preview_mesh(
+            Path(path_str),
+            max_elements=max_elements,
+            max_faces=max_faces,
+        )
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "message": f"Geometry preview failed: {type(exc).__name__}: {exc}",
+        }
+
+
+def _ifc_preview_figure(preview: dict) -> go.Figure:
+    colors = [
+        "#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2",
+        "#B279A2", "#FF9DA6", "#9D755D", "#BAB0AC", "#EECA3B",
+    ]
+    fig = go.Figure()
+    for idx, (ifc_type, group) in enumerate(preview.get("groups", {}).items()):
+        fig.add_trace(go.Mesh3d(
+            x=group["x"], y=group["y"], z=group["z"],
+            i=group["i"], j=group["j"], k=group["k"],
+            name=f"{ifc_type} ({group['elements']})",
+            color=colors[idx % len(colors)],
+            opacity=0.58,
+            flatshading=True,
+        ))
+    fig.update_layout(
+        height=650,
+        scene=dict(
+            aspectmode="data",
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Z",
+        ),
+        margin=dict(l=0, r=0, t=0, b=0),
+        legend=dict(yanchor="top", y=0.98, xanchor="left", x=0.02),
+    )
+    return fig
+
+
+def _show_ifc_preview(abs_path: Path, doc_id: int):
+    with st.expander("3D preview (beta)"):
+        generate = st.toggle("Generate 3D preview", value=False, key=f"ifc_preview_{doc_id}")
+        max_elements = st.slider("Max elements", 20, 200, 80, step=20, key=f"ifc_preview_elements_{doc_id}")
+        max_faces = st.slider("Max faces", 10_000, 100_000, 50_000, step=10_000, key=f"ifc_preview_faces_{doc_id}")
+        if not generate:
+            st.caption("Enable the preview to extract sampled IFC geometry on demand.")
+            return
+
+        with st.spinner("Generating IFC geometry preview..."):
+            preview = _cached_ifc_preview(str(abs_path), abs_path.stat().st_mtime_ns, max_elements, max_faces)
+
+        status = preview.get("status")
+        if status == "ok":
+            st.plotly_chart(_ifc_preview_figure(preview), use_container_width=True)
+            st.caption(
+                f"Sampled {preview.get('sampled_elements', 0)} elements, "
+                f"{preview.get('total_faces', 0)} faces. "
+                f"Skipped {preview.get('skipped_elements', 0)}, failed {preview.get('failed_elements', 0)}."
+            )
+            if preview.get("failed_details"):
+                with st.expander("Failed geometry elements"):
+                    st.dataframe(preview["failed_details"], use_container_width=True, hide_index=True)
+            if preview.get("truncated"):
+                st.warning("Preview truncated at the configured element/face limit for performance.")
+        elif status == "empty":
+            st.info(preview.get("message", "No displayable IFC geometry found."))
+        else:
+            st.warning(preview.get("message", "Geometry preview unavailable."))
+
+
 def _show_doc_detail(doc_id: int):
     with session() as s:
         d = s.get(Document, doc_id)
         if not d:
             st.error("Not found.")
             return
+        project_id = d.project_id
         category = d.category
         filename = d.filename
         status = d.analysis_status
@@ -474,6 +569,8 @@ def _show_doc_detail(doc_id: int):
         data_raw = d.analysis_data_json
         error = d.analysis_error
         path = d.path
+    abs_path = project_dir(project_id) / path
+    data = {}
     st.markdown(f"### {filename}")
     st.caption(f"category: `{category}` · status: **{status}**")
     if summary:
@@ -504,12 +601,10 @@ def _show_doc_detail(doc_id: int):
         if data.get("exif"):
             with st.expander("EXIF"):
                 st.json(data["exif"])
-    # Download button
-    abs_path = project_dir(d.project_id) / path if "d" in dir() and hasattr(d, "project_id") else None
-    # Re-fetch inside session for download
-    with session() as s:
-        d = s.get(Document, doc_id)
-        abs_path = project_dir(d.project_id) / d.path
+    is_ifc = filename.lower().endswith(".ifc") or data.get("format") == "ifc"
+    if is_ifc and abs_path.exists():
+        _show_ifc_preview(abs_path, doc_id)
+
     if abs_path.exists():
         st.download_button(
             "Download original",
