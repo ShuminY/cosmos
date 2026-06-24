@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "skills": {
+    "aholo-3dgs-reconstruction": {
+      "name": "Aholo 3DGS重建与生成",
+      "zip_url": "https://api.skillhub.cn/api/v1/download?slug=aholo-3dgs-reconstruction",
+      "source": "community",
+      "version": "1.0.7",
+      "installedAt": "2026-06-09T07:25:28Z"
+    }
+  }
+}

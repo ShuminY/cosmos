@@ -8,6 +8,7 @@ Provider registry pattern supports:
 """
 from __future__ import annotations
 import json
+import mimetypes
 from datetime import datetime
 from typing import Callable, Any
 
@@ -232,6 +233,145 @@ SYSTEM_PROMPT = """
 
 请基于以上上下文回答用户的问题。
 """
+
+
+# ============ Image Chat Support ============
+import base64
+from pathlib import Path
+
+
+def provider_openai_vision(prompt: str, config: dict, image_paths: list[str] = None) -> tuple[str | None, str | None]:
+    """OpenAI Vision provider - supports image input."""
+    api_key = config.get("api_key", "")
+    base_url = config.get("base_url", "https://api.openai.com/v1")
+    model = config.get("model", "gpt-4o")
+
+    if not api_key:
+        return None, "OpenAI API key not configured"
+
+    content = [{"type": "text", "text": prompt}]
+    if image_paths:
+        for img_path in image_paths:
+            try:
+                mime_type = mimetypes.guess_type(img_path)[0] or "image/png"
+                with open(img_path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("utf-8")
+                content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{b64}",
+                        "detail": "high",
+                    },
+                })
+            except Exception as e:
+                return None, f"读取图片失败 {img_path}: {e}"
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            temperature=0.3,
+            max_tokens=2048,
+        )
+        return response.choices[0].message.content, None
+    except ImportError:
+        return None, "openai package not installed"
+    except Exception as e:
+        return None, str(e)
+
+
+def vision_chat(query: str, image_paths: list[str],
+                session_id: int | None = None,
+                project_id: int | None = None,
+                user_id: int | None = None,
+                provider: str | None = None,
+                title: str | None = None) -> dict:
+    """视觉问答 - 支持多张图片并保存到聊天会话."""
+    if provider is None:
+        provider = get_default_provider()
+
+    if provider not in _providers:
+        return {"answer": None, "error": f"Unknown provider: {provider}", "session_id": session_id}
+
+    provider_config = load_provider_config(provider)
+
+    answer, error = provider_openai_vision(query, provider_config, image_paths)
+    if error:
+        return {"answer": None, "error": error, "session_id": session_id}
+
+    with session() as s:
+        if session_id is None:
+            chat_title = title or (query[:60] + ("..." if len(query) > 60 else ""))
+            chat_sess = ChatSession(
+                project_id=project_id,
+                user_id=user_id,
+                title=chat_title,
+            )
+            s.add(chat_sess)
+            s.flush()
+            session_id = chat_sess.id
+        else:
+            chat_sess = s.get(ChatSession, session_id)
+            if chat_sess:
+                chat_sess.updated_at = datetime.utcnow()
+
+        user_msg = ChatMessage(
+            session_id=session_id,
+            role="user",
+            content=query,
+            images=json.dumps(image_paths) if image_paths else None,
+        )
+        s.add(user_msg)
+
+        assistant_msg = ChatMessage(
+            session_id=session_id,
+            role="assistant",
+            content=answer or "",
+        )
+        s.add(assistant_msg)
+        s.flush()
+        message_id = assistant_msg.id
+        s.commit()
+
+    return {"session_id": session_id, "message_id": message_id, "answer": answer, "error": None}
+
+
+def simple_chat_image(query: str, image_paths: list[str],
+                      session_id: int | None = None,
+                      project_id: int | None = None,
+                      user_id: int | None = None,
+                      provider: str | None = None) -> dict:
+    """无上下文图片聊天 - 支持多张图片."""
+    return vision_chat(
+        query=query,
+        image_paths=image_paths,
+        session_id=session_id,
+        project_id=project_id,
+        user_id=user_id,
+        provider=provider,
+    )
+
+
+def get_image_messages(session_id: int) -> list[dict]:
+    """获取会话消息（含图片信息）. """
+    with session() as s:
+        messages = s.execute(
+            select(ChatMessage).where(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.created_at)
+        ).scalars().all()
+        result = []
+        for msg in messages:
+            item = {
+                "id": msg.id,
+                "role": msg.role,
+                "content": msg.content,
+                "images": json.loads(msg.images) if msg.images else [],
+                "created_at": msg.created_at,
+            }
+            result.append(item)
+        return result
 
 
 def build_prompt(query: str, context_chunks: list[dict]) -> str:

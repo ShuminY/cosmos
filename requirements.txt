@@ -4,8 +4,8 @@ scipy>=1.11
 pillow>=10.0
 
 # Deep Learning
-torch>=2.3
-torchvision>=0.18
+torch>=2.2
+torchvision>=0.17
 transformers>=4.40
 huggingface-hub>=0.23
 
@@ -16,6 +16,7 @@ python-pptx>=1.0
 openpyxl>=3.1
 pandas>=2.2
 pdf2image
+PyMuPDF>=1.24
 pytesseract
 
 # OCR Support
@@ -40,6 +41,7 @@ rich>=13.7
 typer>=0.12
 pyyaml>=6.0
 tqdm>=4.66
+requests>=2.31
 
 # Optional (for advanced features)
 # open3d>=0.18

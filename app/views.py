@@ -27,6 +27,15 @@ from src.settings import get_setting, set_setting
 
 
 # ============ session helpers ============
+def get_current_project() -> Project | None:
+    """从session获取当前选中的项目."""
+    pid = st.session_state.get("current_project_id")
+    if not pid:
+        return None
+    with session() as s:
+        return s.get(Project, pid)
+
+
 def current_user() -> dict | None:
     return st.session_state.get("user")
 
@@ -222,7 +231,7 @@ def view_admin_users():
                  "created": u.created_at.strftime("%Y-%m-%d %H:%M") if u.created_at else "",
                  "last_login": u.last_login_at.strftime("%Y-%m-%d %H:%M") if u.last_login_at else "—"}
                 for u in users]
-    st.dataframe(rows, use_container_width=True)
+    st.dataframe(rows, width="stretch")
 
     st.divider()
     st.subheader("Create user")
@@ -373,6 +382,79 @@ def _proj_overview(p: Project):
         st.markdown(p.description)
 
 
+def _run_3d_modeling(doc_id: int, project_id: int):
+    """为施工照片运行3D建模（使用Aholo 3DGS API）."""
+    import subprocess
+    import sys
+    import time
+    import uuid
+
+    with session() as s:
+        d = s.get(Document, doc_id)
+        if not d:
+            st.error("文档未找到。")
+            return
+        doc_path = project_dir(project_id) / d.path
+
+    if not doc_path.exists():
+        st.error(f"文件不存在: {doc_path}")
+        return
+
+    # 检查文件类型（只支持图片）
+    suffix = doc_path.suffix.lower()
+    if suffix not in ['.jpg', '.jpeg', '.png']:
+        st.error("Aholo 3D建模只支持图片(JPG/PNG)文件。")
+        return
+
+    # 创建专用的3D建模任务
+    job_id = f"job_3d_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}_doc{doc_id}"
+    jdir = jobs_dir(project_id)
+    jdir.mkdir(parents=True, exist_ok=True)
+
+    st.info(f"启动Aholo 3D建模任务 **{job_id}**...")
+
+    # 准备输出目录
+    outputs_dir = project_dir(project_id) / "3d_models" / f"doc_{doc_id}"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    # 创建状态文件
+    status_path = jdir / f"{job_id}.json"
+    status_data = {
+        "job_id": job_id,
+        "doc_id": doc_id,
+        "project_id": project_id,
+        "overall_status": "running",
+        "provider": "aholo3d",
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "stages": [
+            {"name": "upload", "status": "pending"},
+            {"name": "create_task", "status": "pending"},
+            {"name": "processing", "status": "pending"},
+            {"name": "download", "status": "pending"},
+        ]
+    }
+    status_path.write_text(json.dumps(status_data, indent=2))
+
+    # 启动后台进程调用Aholo 3D API
+    cmd = [
+        sys.executable, str(Path(__file__).resolve().parent.parent / "scripts" / "run_aholo3d.py"),
+        "--job-id", job_id,
+        "--doc-id", str(doc_id),
+        "--project-id", str(project_id),
+        "--image-path", str(doc_path),
+        "--output-dir", str(outputs_dir),
+        "--status-path", str(status_path),
+    ]
+
+    # 启动后台进程
+    log = (jdir / f"{job_id}.log").open("w")
+    subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+
+    st.success(f"3D建模任务 **{job_id}** 已启动。任务完成后可在下方查看结果。")
+    st.session_state["last_3d_job_id"] = job_id
+    st.rerun()
+
+
 def _proj_documents(p: Project):
     st.subheader("Upload document")
     with st.form("doc_upload", clear_on_submit=True):
@@ -426,13 +508,117 @@ def _proj_documents(p: Project):
         rows = rows_by_cat.get(key, [])
         if rows:
             with st.expander(f"**{label}** — {len(rows)} file(s)", expanded=True):
-                st.dataframe(rows, use_container_width=True, hide_index=True)
+                st.dataframe(rows, width="stretch", hide_index=True)
                 doc_ids = [r["id"] for r in rows]
                 pick = st.selectbox("Inspect document", doc_ids,
                                     format_func=lambda i: next(r["filename"] for r in rows if r["id"] == i),
                                     key=f"pick_{key}")
-                if pick and st.button("View analysis", key=f"view_{key}"):
-                    _show_doc_detail(pick)
+                c1, c2 = st.columns(2)
+                with c1:
+                    if pick and st.button("View analysis", key=f"view_{key}"):
+                        _show_doc_detail(pick)
+                with c2:
+                    # 施工照片类别添加3D建模按钮
+                    if key == "07_photos" and pick and st.button("3D建模", key=f"3d_{key}", type="primary"):
+                        _run_3d_modeling(pick, p.id)
+
+    # 3D建模任务状态查看
+    st.divider()
+    st.subheader("3D建模任务状态")
+    jdir = jobs_dir(p.id)
+    if jdir.exists():
+        # 查找所有3D建模相关的job文件
+        job_files = sorted(jdir.glob("job_3d_*.json"), reverse=True)[:10]
+        if job_files:
+            for jf in job_files:
+                try:
+                    d = json.loads(jf.read_text())
+                    job_id = d.get("job_id", "unknown")
+                    status = d.get("overall_status", "unknown")
+                    # 获取对应文档信息
+                    doc_id = None
+                    if "_doc" in job_id:
+                        try:
+                            doc_id = int(job_id.split("_doc")[-1].split("_")[0])
+                        except:
+                            pass
+
+                    status_emoji = {"pending": "⚪", "running": "🟡", "done": "✅", "failed": "❌"}.get(status, "•")
+
+                    with st.expander(f"{status_emoji} **{job_id}** — {status}", expanded=(status == "running")):
+                        st.caption(f"开始时间: {d.get('started_at', '—')}")
+                        st.caption(f"更新时间: {d.get('updated_at', '—')}")
+                        if doc_id:
+                            st.caption(f"关联文档ID: #{doc_id}")
+
+                        # 显示Aholo3d特有信息
+                        provider = d.get("provider", "colmap")
+                        if provider == "aholo3d":
+                            st.caption(f"🔧 服务商: Aholo 3DGS")
+                            if "world_id" in d:
+                                st.caption(f"🌍 World ID: `{d['world_id']}`")
+                            if "asset_id" in d:
+                                st.caption(f"📦 Asset ID: `{d['asset_id']}`")
+                            if "progress" in d:
+                                st.progress(d["progress"] / 100, text=f"处理进度: {d['progress']:.1f}%")
+
+                        # 显示各阶段状态
+                        for s in d.get("stages", []):
+                            emoji = {"pending": "⚪", "running": "🟡", "done": "✅", "failed": "❌", "skipped": "⏭️"}.get(s["status"], "•")
+                            msg = f" — {s.get('message', '')}" if s.get("message") else ""
+                            # 中文阶段名映射
+                            stage_names = {
+                                "upload": "上传图片",
+                                "create_task": "创建任务",
+                                "processing": "3D重建",
+                                "download": "下载结果",
+                                "extract_frames": "提取帧",
+                                "reconstruct": "点云重建",
+                            }
+                            stage_name = stage_names.get(s["name"], s["name"])
+                            st.markdown(f"{emoji} **{stage_name}** · {s['status']}{msg}")
+
+                        # 显示日志
+                        log_p = jdir / f"{job_id}.log"
+                        if log_p.exists():
+                            with st.expander("查看日志"):
+                                log_content = log_p.read_text()
+                                st.code(log_content[-4000:] if len(log_content) > 4000 else log_content, language="text")
+
+                        # 检查生成的文件
+                        if doc_id:
+                            output_dir = project_dir(p.id) / "3d_models" / f"doc_{doc_id}"
+                            # 查找所有3D模型文件
+                            model_files = list(output_dir.rglob("*.ply")) + list(output_dir.rglob("*.splat")) + list(output_dir.rglob("*.obj"))
+
+                            if model_files:
+                                st.success(f"✅ 已生成 {len(model_files)} 个3D模型文件:")
+                                for f in model_files:
+                                    col1, col2 = st.columns([3, 1])
+                                    col1.code(str(f.relative_to(project_dir(p.id))))
+                                    # 提供下载按钮
+                                    with open(f, "rb") as file:
+                                        col2.download_button(
+                                            "下载",
+                                            data=file.read(),
+                                            file_name=f.name,
+                                            mime="application/octet-stream",
+                                            key=f"dl_{job_id}_{f.name}",
+                                        )
+
+                                # 在Point Cloud页面查看按钮
+                                ply_files = [f for f in model_files if f.suffix == ".ply"]
+                                if ply_files and st.button("在Point Cloud页面查看", key=f"view_pcd_{job_id}"):
+                                    st.session_state["goto_pointcloud"] = str(ply_files[0])
+                                    st.rerun()
+                            elif status == "done":
+                                st.warning("⚠️ 任务已完成，但未找到3D模型文件")
+                except Exception as e:
+                    st.error(f"读取任务文件失败: {e}")
+        else:
+            st.info("暂无3D建模任务")
+    else:
+        st.info("暂无3D建模任务")
 
 
 def _save_document_record(*, project_id, category, filename, path, size_bytes, uploaded_by_id) -> int:
@@ -493,7 +679,7 @@ def _show_doc_detail(doc_id: int):
             for sh in data["sheets"][:5]:
                 with st.expander(f"Sheet · {sh['name']} ({sh.get('n_rows','?')} rows × {sh.get('n_cols','?')} cols)"):
                     if sh.get("preview"):
-                        st.dataframe(sh["preview"], use_container_width=True)
+                        st.dataframe(sh["preview"], width="stretch")
         if data.get("element_counts"):
             st.markdown("**IFC element counts:**")
             st.json(data["element_counts"])
@@ -572,7 +758,7 @@ def _proj_materials(p: Project):
                  "size_mm": f"{m.dim_w_mm or '?'} × {m.dim_h_mm or '?'}"}
                 for m in mats]
     if rows:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
     else:
         st.info("No materials yet.")
 
@@ -743,7 +929,7 @@ def _proj_settings(p: Project):
             member_rows.append({"user": uu.email, "role": m.role,
                                 "added": m.added_at.strftime("%Y-%m-%d") if m.added_at else ""})
     if member_rows:
-        st.dataframe(member_rows, use_container_width=True, hide_index=True)
+        st.dataframe(member_rows, width="stretch", hide_index=True)
     else:
         st.caption("No members yet.")
     with session() as s:

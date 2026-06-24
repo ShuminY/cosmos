@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(claude-api)",
+      "Skill(claude-api:*)",
+      "Bash(python3 -m py_compile app/views_drawings.py src/chatbot.py app/streamlit_app.py)",
+      "Bash(python3 -)",
+      "Bash(.venv/bin/python -)",
+      "Bash(python3 -m py_compile app/views_kb.py app/views.py app/streamlit_app.py app/views_tasks.py app/views_drawings.py)"
+    ]
+  }
+}

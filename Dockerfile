@@ -1,5 +1,5 @@
 # 基于 Python 3.11
-FROM python:3.11-slim
+FROM docker.m.daocloud.io/library/python:3.11-slim
 
 # 安装系统依赖（OCR 所需）
 RUN apt-get update && apt-get install -y \
@@ -35,6 +35,7 @@ RUN pip install --no-cache-dir \
     opencv-python \
     plotly \
     pdf2image \
+    PyMuPDF \
     pytesseract \
     pillow
 

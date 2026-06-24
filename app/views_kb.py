@@ -13,7 +13,7 @@ from src.kb import kb_status, index_document, index_project_documents, search_kb
 from src.chatbot import (
     chat, list_chat_sessions, get_chat_messages, delete_chat_session,
     get_available_providers, get_default_provider, set_default_provider,
-    load_provider_config, save_provider_config,
+    load_provider_config, save_provider_config, simple_chat_image, get_image_messages,
 )
 
 init_db()
@@ -300,4 +300,171 @@ def view_chatbot():
                 # Update session in state if it was newly created
                 if "current_chat_session" not in st.session_state or st.session_state["current_chat_session"] != result["session_id"]:
                     st.session_state["current_chat_session"] = result["session_id"]
+                    st.rerun()
+
+
+# ============ Image Chat View ============
+def view_chat_image():
+    """图片聊天 - 支持上传多张图片，通过sessionId关联上下文."""
+    st.title("📷 图片问答")
+    st.caption("上传多张图片进行视觉问答，支持上下文关联")
+
+    projects = _get_visible_projects()
+    if not projects:
+        st.info("您还没有任何项目。")
+        return
+
+    # Top bar
+    col1, col2, col3 = st.columns([3, 2, 2])
+    with col1:
+        project_names = [p.name for p in projects]
+        project_idx = st.selectbox("选择项目", range(len(projects)),
+                                    format_func=lambda i: project_names[i],
+                                    key="img_chat_project")
+        project = projects[project_idx]
+
+    with col2:
+        providers = get_available_providers()
+        default_provider = get_default_provider()
+        provider = st.selectbox("LLM 提供商", providers,
+                                index=providers.index(default_provider) if default_provider in providers else 0,
+                                key="img_chat_provider")
+
+    with col3:
+        if st.button("➕ 新对话", type="primary"):
+            st.session_state.pop("img_chat_session", None)
+            st.session_state["img_uploaded_files"] = []
+            st.rerun()
+
+    # Session history
+    sessions = list_chat_sessions(project_id=project.id, user_id=_user_id())
+    if sessions:
+        with st.expander("📜 对话历史", expanded=False):
+            for sess in sessions:
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    if st.button(sess.title or "新对话", key=f"img_sess_{sess.id}"):
+                        st.session_state["img_chat_session"] = sess.id
+                        st.rerun()
+                with col2:
+                    if st.button("🗑️", key=f"img_del_{sess.id}", help="删除对话"):
+                        delete_chat_session(sess.id)
+                        if st.session_state.get("img_chat_session") == sess.id:
+                            st.session_state.pop("img_chat_session", None)
+                        st.rerun()
+
+    st.divider()
+
+    # Image upload area
+    session_id = st.session_state.get("img_chat_session")
+
+    col_upload, col_preview = st.columns([1, 3])
+    with col_upload:
+        uploaded_files = st.file_uploader(
+            "上传图片（多张）",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            key=f"img_upload_{session_id or 'new'}",
+        )
+        # 清除按钮
+        if st.button("清除已上传图片"):
+            st.session_state["img_uploaded_files"] = []
+            st.rerun()
+
+    # 显示已有图片（从session_state）
+    if "img_uploaded_files" not in st.session_state:
+        st.session_state["img_uploaded_files"] = []
+
+    if uploaded_files:
+        st.session_state["img_uploaded_files"] = uploaded_files
+
+    if st.session_state["img_uploaded_files"]:
+        with col_preview:
+            cols = st.columns(min(4, len(st.session_state["img_uploaded_files"])))
+            for i, f in enumerate(st.session_state["img_uploaded_files"]):
+                cols[i % len(cols)].image(f, caption=f.name, width="stretch")
+
+    # Display chat history
+    if session_id:
+        messages = get_image_messages(session_id)
+        for msg in messages:
+            with st.chat_message(msg["role"]):
+                # Show images in user messages
+                if msg["images"]:
+                    cols = st.columns(min(3, len(msg["images"])))
+                    for i, img_path in enumerate(msg["images"]):
+                        p = Path(img_path)
+                        if p.exists():
+                            cols[i % len(cols)].image(str(p), width="stretch")
+                st.markdown(msg["content"])
+
+    # Chat input
+    user_input = st.chat_input("输入问题（可选，纯图片也可发送）...")
+    if user_input or st.session_state["img_uploaded_files"]:
+        if st.session_state["img_uploaded_files"]:
+            # Save images to disk
+            import time
+            from src.storage import project_dir
+            chat_img_dir = project_dir(project.id) / "chat_images"
+            chat_img_dir.mkdir(parents=True, exist_ok=True)
+
+            saved_paths = []
+            for f in st.session_state["img_uploaded_files"]:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                save_path = chat_img_dir / f"{ts}_{f.name}"
+                save_path.write_bytes(f.getbuffer())
+                saved_paths.append(str(save_path))
+
+            # Display user message
+            with st.chat_message("user"):
+                cols = st.columns(min(3, len(saved_paths)))
+                for i, sp in enumerate(saved_paths):
+                    cols[i % len(cols)].image(sp, width="stretch")
+                if user_input:
+                    st.markdown(user_input)
+
+            # Generate response
+            with st.chat_message("assistant"):
+                with st.spinner("正在分析图片..."):
+                    result = simple_chat_image(
+                        query=user_input or "请描述这些图片",
+                        image_paths=saved_paths,
+                        session_id=session_id,
+                        project_id=project.id,
+                        user_id=_user_id(),
+                        provider=provider,
+                    )
+
+                if result.get("error"):
+                    st.error(f"错误: {result['error']}")
+                else:
+                    st.markdown(result["answer"])
+
+                # Update session
+                if result["session_id"] != session_id:
+                    st.session_state["img_chat_session"] = result["session_id"]
+                    st.session_state["img_uploaded_files"] = []
+                    st.rerun()
+
+            st.session_state["img_uploaded_files"] = []
+        elif user_input:
+            # Text only - use simple chat
+            with st.chat_message("user"):
+                st.markdown(user_input)
+            with st.chat_message("assistant"):
+                with st.spinner("正在生成回答..."):
+                    result = simple_chat_image(
+                        query=user_input,
+                        image_paths=[],
+                        session_id=session_id,
+                        project_id=project.id,
+                        user_id=_user_id(),
+                        provider=provider,
+                    )
+                if result.get("error"):
+                    st.error(f"错误: {result['error']}")
+                else:
+                    st.markdown(result["answer"])
+                if result["session_id"] != session_id:
+                    st.session_state["img_chat_session"] = result["session_id"]
                     st.rerun()

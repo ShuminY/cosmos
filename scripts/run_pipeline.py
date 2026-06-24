@@ -28,7 +28,7 @@ from src.storage import (
 )
 
 
-STAGES = ["extract_frames", "segment", "recrop_masks", "match_references", "summarize"]
+STAGES = ["extract_frames", "reconstruct", "segment", "recrop_masks", "match_references", "summarize"]
 
 
 def update_status(status_path: Path, **kwargs):
@@ -92,6 +92,8 @@ def main():
     p.add_argument("--video", type=Path, default=None,
                    help="Optional override video path (otherwise uses capture.src_video_path)")
     p.add_argument("--fps", type=float, default=2.0)
+    p.add_argument("--reconstruct", action="store_true",
+                   help="运行3D重建（COLMAP）生成点云模型")
     args = p.parse_args()
 
     init_db()
@@ -155,7 +157,22 @@ def main():
                 c.frames_count = n_frames
                 ses.add(c)
 
-        # 2) segment
+        # 2) reconstruct (3D建模) - 仅在启用时运行
+        if args.reconstruct:
+            mark("reconstruct", "running")
+            rc = run_stage("reconstruct", [
+                py, str(ROOT / "src" / "02_reconstruct.py"),
+                str(paths["frames"]), str(paths["outputs"] / "sparse"),
+            ], log_path)
+            if rc != 0:
+                mark("reconstruct", "failed", f"exit={rc}")
+                # 3D重建失败不中断整个流程，继续后续步骤
+            else:
+                mark("reconstruct", "done", "sparse point cloud generated")
+        else:
+            mark("reconstruct", "skipped", "3D reconstruction not enabled")
+
+        # 3) segment
         mark("segment", "running")
         rc = run_stage("segment", [
             py, str(ROOT / "src" / "04_segment.py"),

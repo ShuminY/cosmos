@@ -38,10 +38,12 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from views import (
     view_login, view_profile, view_admin_users,
-    view_projects, view_project_detail,
+    view_projects, view_project_detail, get_current_project,
     current_user, is_admin, require_login,
 )
-from views_kb import view_knowledge_base, view_chatbot, view_llm_settings
+from views_kb import view_knowledge_base, view_chatbot, view_chat_image, view_llm_settings
+from views_tasks import view_task_tracking
+from views_drawings import view_drawing_analysis
 from src.db import init_db
 init_db()
 
@@ -162,8 +164,10 @@ st.sidebar.divider()
 
 nav_groups = {
     "📂 Projects": ["Projects"],
-    "💡 智能问答": ["知识库", "智能问答"],
-    "🧪 Demo data": ["Overview", "Upload", "Visits", "World model", "Segments",
+    "📋 任务追踪": ["Tasks"],
+    "📐 图纸分析": ["图纸分析"],
+    "💡 智能问答": ["知识库", "智能问答", "图片问答"],
+    "🧪 Demo data": ["Overview", "Upload", "Visits", "World model", "Point Cloud", "Segments",
                      "Matches (HITL)", "References", "Change report"],
     "👤 Account": ["Profile"],
 }
@@ -232,7 +236,7 @@ def page_overview():
             "detected (crop Δ)": det.get("crop_delta", 0),
             "detected (frame Δ)": det.get("frame_delta", 0),
         })
-    st.dataframe(rows, use_container_width=True)
+    st.dataframe(rows, width="stretch")
 
     st.subheader("Known limitations")
     for lim in report.get("known_limitations", []):
@@ -242,10 +246,10 @@ def page_overview():
     hero_left, hero_right = st.columns(2)
     with hero_left:
         st.caption("visit 1 (before) — frame_00015")
-        st.image(str(DATA / "visit_1" / "frames" / "frame_00015.jpg"), use_container_width=True)
+        st.image(str(DATA / "visit_1" / "frames" / "frame_00015.jpg"), width="stretch")
     with hero_right:
         st.caption("visit 2 (after) — frame_00015")
-        st.image(str(DATA / "visit_2" / "frames" / "frame_00015.jpg"), use_container_width=True)
+        st.image(str(DATA / "visit_2" / "frames" / "frame_00015.jpg"), width="stretch")
 
 
 def page_upload():
@@ -282,10 +286,17 @@ def page_upload():
         with col2:
             fps = st.slider("Frames per second to extract", 1.0, 6.0, 2.0, 0.5)
         video = st.file_uploader("Video", type=["mp4", "mov", "MOV", "MP4", "m4v", "mkv"])
-        submitted = st.form_submit_button("Start pipeline", type="primary",
-                                          disabled=len(running) > 0)
+        enable_3d = st.checkbox("启用3D建模", value=False,
+                                 help="上传后自动生成3D点云模型（需要open3d）")
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            submitted = st.form_submit_button("Start pipeline", type="primary",
+                                              disabled=len(running) > 0)
+        with col_btn2:
+            submitted_3d = st.form_submit_button("生成3D模型", type="secondary",
+                                                  disabled=len(running) > 0 or not enable_3d)
 
-    if submitted:
+    if submitted or submitted_3d:
         if not video:
             st.error("Please pick a video file.")
         else:
@@ -312,6 +323,11 @@ def page_upload():
                 "--root", str(ROOT),
                 "--fps", str(fps),
             ]
+            # 如果点击了3D建模按钮，添加3D重建参数
+            if submitted_3d:
+                cmd.extend(["--reconstruct"])
+                st.info("已启用3D建模模式，将在处理完成后生成点云模型...")
+
             # Detached subprocess so streamlit can keep serving
             log = (jobs_dir / f"{job_id}.subprocess.log").open("w")
             subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
@@ -389,16 +405,16 @@ def page_visits():
         with col1:
             st.caption(f"visit_{visit} · {fp.name}")
             img = overlay_masks(fp, seg_dir) if overlay and seg_dir.exists() else cv2.cvtColor(cv2.imread(str(fp)), cv2.COLOR_BGR2RGB)
-            st.image(img, use_container_width=True)
+            st.image(img, width="stretch")
         with col2:
             other_fp = other_frames[idx]
             other_seg = OUTPUTS / f"visit_{other}" / "segments"
             st.caption(f"visit_{other} · {other_fp.name}")
             img2 = overlay_masks(other_fp, other_seg) if overlay and other_seg.exists() else cv2.cvtColor(cv2.imread(str(other_fp)), cv2.COLOR_BGR2RGB)
-            st.image(img2, use_container_width=True)
+            st.image(img2, width="stretch")
     else:
         img = overlay_masks(fp, seg_dir) if overlay and seg_dir.exists() else cv2.cvtColor(cv2.imread(str(fp)), cv2.COLOR_BGR2RGB)
-        st.image(img, use_container_width=True)
+        st.image(img, width="stretch")
 
     # Per-frame instance details
     manifest = load_json(seg_dir / "manifest.json")
@@ -409,7 +425,7 @@ def page_visits():
             st.dataframe(
                 [{"instance_id": r["instance_id"], "class": r["class"], "score": round(r["score"], 3),
                   "area_px": r["area_px"]} for r in rows],
-                use_container_width=True,
+                width="stretch",
             )
 
 
@@ -480,7 +496,7 @@ def page_world_model():
         margin=dict(l=0, r=0, t=0, b=0),
         legend=dict(yanchor="top", y=0.98, xanchor="left", x=0.02),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     if summary:
         st.markdown("**Sparse-cloud sizes:** " + ", ".join(f"{n}={c} points" for n, c in summary))
@@ -495,6 +511,204 @@ def page_world_model():
 - For a *textured* 3D model: rent a GPU for an hour, run `gsplat` or COLMAP dense MVS — the same input video gives a photoreal scene.
             """
         )
+
+
+def page_point_cloud():
+    """点云查看器 - 支持加载和显示PLY文件."""
+    st.title("Point Cloud Viewer — 点云查看器")
+    st.caption("上传或选择PLY点云文件进行3D可视化")
+
+    if not OPEN3D_AVAILABLE:
+        st.warning("⚠️ Open3D 未安装。请运行: `pip install open3d` 以启用3D点云功能。")
+        return
+
+    # 文件选择方式
+    tab1, tab2 = st.tabs(["📁 选择现有文件", "📤 上传PLY文件"])
+
+    pcd = None
+    file_name = None
+
+    with tab1:
+        # 扫描所有可能的PLY文件位置
+        ply_files = []
+
+        # 1. Demo数据目录
+        for visit in [1, 2]:
+            sparse_dir = OUTPUTS / f"visit_{visit}" / "sparse"
+            if sparse_dir.exists():
+                for ply in sparse_dir.rglob("*.ply"):
+                    ply_files.append((f"Demo visit_{visit}: {ply.name}", ply))
+
+        # 2. 项目目录中的3D模型（从施工照片3D建模生成的）
+        # 扫描 data/projects/*/3d_models/
+        projects_dir = DATA / "projects"
+        if projects_dir.exists():
+            for project_dir in projects_dir.iterdir():
+                if project_dir.is_dir():
+                    models_dir = project_dir / "3d_models"
+                    if models_dir.exists():
+                        for ply in models_dir.rglob("*.ply"):
+                            rel_path = ply.relative_to(models_dir)
+                            ply_files.append((f"Project {project_dir.name}: {rel_path}", ply))
+
+        # 3. 全局3D模型目录（兼容旧版本）
+        global_models_dir = ROOT / "3d_models"
+        if global_models_dir.exists():
+            for ply in global_models_dir.rglob("*.ply"):
+                rel_path = ply.relative_to(global_models_dir)
+                ply_files.append((f"Global: {rel_path}", ply))
+
+        # 4. 用户上传的点云文件
+        uploaded_dir = DATA / "pointclouds"
+        if uploaded_dir.exists():
+            for ply in uploaded_dir.rglob("*.ply"):
+                ply_files.append((f"Uploaded: {ply.name}", ply))
+
+        if not ply_files:
+            st.info("未找到现有的PLY文件。请先运行3D建模或上传一个PLY文件。")
+        else:
+            options = [name for name, _ in ply_files]
+            selected = st.selectbox("选择点云文件", options)
+            if selected:
+                file_name = selected
+                pcd_path = dict(ply_files)[selected]
+                try:
+                    pcd = o3d.io.read_point_cloud(str(pcd_path))
+                    st.success(f"已加载: {pcd_path}")
+                except Exception as e:
+                    st.error(f"加载失败: {e}")
+
+    with tab2:
+        uploaded = st.file_uploader("上传PLY文件", type=["ply"])
+        save_uploaded = st.checkbox("保存到项目目录", value=True,
+                                     help="将上传的PLY文件保存到 data/pointclouds/ 目录以便后续查看")
+        if uploaded:
+            try:
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmp:
+                    tmp.write(uploaded.getbuffer())
+                    tmp_path = tmp.name
+                pcd = o3d.io.read_point_cloud(tmp_path)
+                file_name = uploaded.name
+
+                # 保存到项目目录
+                if save_uploaded:
+                    save_dir = DATA / "pointclouds"
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    save_path = save_dir / uploaded.name
+                    # 如果文件已存在，添加时间戳
+                    if save_path.exists():
+                        from datetime import datetime
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        name = uploaded.name.replace(".ply", f"_{timestamp}.ply")
+                        save_path = save_dir / name
+                        file_name = name
+                    import shutil
+                    shutil.copy(tmp_path, save_path)
+                    st.success(f"已上传并保存: {file_name}")
+                    st.caption(f"保存路径: {save_path}")
+                else:
+                    st.success(f"已上传: {uploaded.name}")
+            except Exception as e:
+                st.error(f"上传文件读取失败: {e}")
+
+    # 显示点云
+    if pcd is not None and len(pcd.points) > 0:
+        st.divider()
+        st.subheader(f"📊 点云信息: {file_name or 'Unknown'}")
+
+        # 点云统计信息
+        xyz = np.asarray(pcd.points)
+        n_points = len(xyz)
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("点数", f"{n_points:,}")
+        col2.metric("X范围", f"{xyz[:,0].min():.2f} ~ {xyz[:,0].max():.2f}")
+        col3.metric("Y范围", f"{xyz[:,1].min():.2f} ~ {xyz[:,1].max():.2f}")
+        col4.metric("Z范围", f"{xyz[:,2].min():.2f} ~ {xyz[:,2].max():.2f}")
+
+        # 颜色信息
+        has_colors = len(pcd.colors) > 0
+        rgb = np.asarray(pcd.colors) if has_colors else np.full((n_points, 3), 0.5)
+
+        # 可视化选项
+        st.divider()
+        viz_col1, viz_col2, viz_col3 = st.columns(3)
+        with viz_col1:
+            point_size = st.slider("点大小", 1, 10, 3)
+        with viz_col2:
+            opacity = st.slider("透明度", 0.1, 1.0, 0.8)
+        with viz_col3:
+            show_axis = st.checkbox("显示坐标轴", value=True)
+
+        # 3D可视化
+        st.subheader("🎯 3D可视化")
+
+        # 采样显示（如果点太多）
+        max_display = 50000
+        if n_points > max_display:
+            st.caption(f"⚠️ 点数过多 ({n_points:,})，显示随机采样的 {max_display:,} 个点")
+            indices = np.random.choice(n_points, max_display, replace=False)
+            xyz_display = xyz[indices]
+            rgb_display = rgb[indices]
+        else:
+            xyz_display = xyz
+            rgb_display = rgb
+
+        # Plotly 3D散点图
+        colors = [f"rgb({int(r*255)},{int(g*255)},{int(b*255)})" for r, g, b in rgb_display]
+
+        fig = go.Figure(data=[go.Scatter3d(
+            x=xyz_display[:, 0],
+            y=xyz_display[:, 1],
+            z=xyz_display[:, 2],
+            mode='markers',
+            marker=dict(
+                size=point_size,
+                color=colors if has_colors else 'lightgray',
+                opacity=opacity
+            ),
+            text=[f"Point {i}<br>x={x:.3f}<br>y={y:.3f}<br>z={z:.3f}" for i, (x, y, z) in enumerate(xyz_display)],
+            hoverinfo='text'
+        )])
+
+        # 添加坐标轴
+        if show_axis:
+            axis_length = np.max(np.abs(xyz)) * 0.3
+            fig.add_trace(go.Scatter3d(
+                x=[0, axis_length], y=[0, 0], z=[0, 0],
+                mode='lines', line=dict(color='red', width=4), name='X轴'
+            ))
+            fig.add_trace(go.Scatter3d(
+                x=[0, 0], y=[0, axis_length], z=[0, 0],
+                mode='lines', line=dict(color='green', width=4), name='Y轴'
+            ))
+            fig.add_trace(go.Scatter3d(
+                x=[0, 0], y=[0, 0], z=[0, axis_length],
+                mode='lines', line=dict(color='blue', width=4), name='Z轴'
+            ))
+
+        fig.update_layout(
+            height=700,
+            scene=dict(
+                aspectmode='data',
+                xaxis_title='X',
+                yaxis_title='Y',
+                zaxis_title='Z',
+            ),
+            margin=dict(l=0, r=0, t=30, b=0),
+            title=dict(text=f"{file_name or 'Point Cloud'} ({n_points:,} points)", x=0.5)
+        )
+
+        st.plotly_chart(fig, width="stretch")
+
+        # 下载按钮
+        st.divider()
+        if st.button("💾 导出当前视图为PNG"):
+            st.info("右键点击上方3D图形，选择'Save image as'即可保存图片。")
+
+    elif pcd is not None and len(pcd.points) == 0:
+        st.error("❌ 点云文件为空（0个点）")
 
 
 def page_segments():
@@ -521,7 +735,7 @@ def page_segments():
         crop_path = seg_dir / f"{item['instance_id']}_crop.jpg"
         with cols[i % 4]:
             if crop_path.exists():
-                st.image(str(crop_path), caption=f"{item['class']} · {item['score']:.2f}", use_container_width=True)
+                st.image(str(crop_path), caption=f"{item['class']} · {item['score']:.2f}", width="stretch")
             else:
                 st.text(item["instance_id"])
 
@@ -568,7 +782,7 @@ def page_matches():
             cc = st.columns([1, 2, 1])
             crop_path = seg_dir / f"{iid}_crop.jpg"
             if crop_path.exists():
-                cc[0].image(str(crop_path), use_container_width=True)
+                cc[0].image(str(crop_path), width="stretch")
             cc[1].markdown(f"**{iid}**")
             cc[1].markdown(f"detected class: `{r['cls']}`")
             cc[1].markdown(
@@ -607,7 +821,7 @@ def page_references():
             imgs = sorted(p for p in skud.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
             cols = st.columns(min(6, max(1, len(imgs))))
             for i, ip in enumerate(imgs):
-                cols[i % len(cols)].image(str(ip), caption=ip.name, use_container_width=True)
+                cols[i % len(cols)].image(str(ip), caption=ip.name, width="stretch")
 
 
 def page_diff():
@@ -655,17 +869,21 @@ def page_diff():
 PAGES = {
     # New multi-tenant
     "Projects": view_projects,
+    "Tasks": lambda: view_task_tracking(get_current_project()),
+    "图纸分析": lambda: view_drawing_analysis(get_current_project()),
     "Profile": view_profile,
     "Users": view_admin_users,
     "LLM 设置": view_llm_settings,
     # Knowledge Base
     "知识库": view_knowledge_base,
     "智能问答": view_chatbot,
+    "图片问答": view_chat_image,
     # Demo data (preserved as a reference of what the pipeline produces)
     "Overview": page_overview,
     "Upload": page_upload,
     "Visits": page_visits,
     "World model": page_world_model,
+    "Point Cloud": page_point_cloud,
     "Segments": page_segments,
     "Matches (HITL)": page_matches,
     "References": page_references,

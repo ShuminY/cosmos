@@ -64,6 +64,22 @@ class Project(Base):
                             cascade="all, delete-orphan")
     chat_sessions = relationship("ChatSession", back_populates="project",
                                  cascade="all, delete-orphan")
+    tasks = relationship("Task", back_populates="project",
+                         cascade="all, delete-orphan")
+    tasks = relationship("Task", back_populates="project",
+                         cascade="all, delete-orphan")
+    tasks = relationship("Task", back_populates="project",
+                         cascade="all, delete-orphan")
+    tasks = relationship("Task", back_populates="project",
+                         cascade="all, delete-orphan")
+    tasks = relationship("Task", back_populates="project",
+                         cascade="all, delete-orphan")
+    tasks = relationship("Task", back_populates="project",
+                         cascade="all, delete-orphan")
+    tasks = relationship("Task", back_populates="project",
+                         cascade="all, delete-orphan")
+    tasks = relationship("Task", back_populates="project",
+                         cascade="all, delete-orphan")
 
 
 class ProjectMember(Base):
@@ -190,6 +206,7 @@ class ChatMessage(Base):
     role = Column(String(32), nullable=False)  # 'user' | 'assistant'
     content = Column(Text, nullable=False)
     context_chunk_ids = Column(Text, nullable=True)  # JSON list of chunk IDs used
+    images = Column(Text, nullable=True)  # JSON list of image paths (rel to data/)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     session = relationship("ChatSession", back_populates="messages")
@@ -224,6 +241,68 @@ class Job(Base):
     finished_at = Column(DateTime, nullable=True)
     log_path = Column(String(1024), nullable=True)
     error = Column(Text, nullable=True)
+
+
+# ============ Task Tracking ============
+class Task(Base):
+    """施工任务追踪表."""
+    __tablename__ = "tasks"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    status = Column(String(32), nullable=False, default="pending")
+    # 'pending' | 'in_progress' | 'completed' | 'cancelled'
+    priority = Column(String(16), nullable=False, default="medium")
+    # 'low' | 'medium' | 'high' | 'urgent'
+    created_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    assigned_to_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    due_date = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    project = relationship("Project", back_populates="tasks")
+    snapshots = relationship("TaskSnapshot", back_populates="task",
+                             cascade="all, delete-orphan",
+                             order_by="TaskSnapshot.created_at")
+    analysis_result = Column(Text, nullable=True)  # AI分析的进度结果（最新一条，兼容旧数据）
+    model_3d_info = Column(Text, nullable=True)  # 3D建模结果（JSON: world_id, output_files）
+    analyses = relationship("TaskAnalysis", back_populates="task",
+                             cascade="all, delete-orphan",
+                             order_by="TaskAnalysis.created_at")
+
+
+class TaskSnapshot(Base):
+    """任务进度快照（上传的图片记录）."""
+    __tablename__ = "task_snapshots"
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False, index=True)
+    snapshot_type = Column(String(32), nullable=False)
+    # 'initial' | 'progress' | 'final'
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    file_path = Column(String(512), nullable=False)  # 相对路径
+    file_size = Column(Integer, nullable=True)
+    taken_at = Column(DateTime, nullable=True)  # 照片拍摄时间
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    task = relationship("Task", back_populates="snapshots")
+
+
+class TaskAnalysis(Base):
+    """任务进度分析记录（每次分析的独立记录）."""
+    __tablename__ = "task_analyses"
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False, index=True)
+    result = Column(Text, nullable=False)  # AI分析结果全文
+    images_used = Column(Text, nullable=True)  # JSON: 使用的图片路径列表
+    base_image = Column(String(512), nullable=True)  # 基准图路径
+    compare_image = Column(String(512), nullable=True)  # 对比图路径
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    task = relationship("Task", back_populates="analyses")
 
 
 # ============ taxonomy from the Excel spec ============
