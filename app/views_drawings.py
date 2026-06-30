@@ -4,6 +4,8 @@ import base64
 import html
 import json
 import re
+import subprocess
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
@@ -589,8 +591,9 @@ def _render_review_items_table(items: list[dict]):
     st.markdown(table_html, unsafe_allow_html=True)
 
 
-def _load_annotation_font(size: int, bold: bool = False):
-    """加载支持中文的标注字体，失败时回退到Pillow默认字体."""
+@lru_cache(maxsize=1)
+def _find_chinese_font_path() -> str | None:
+    """尽量在不同系统上找到可渲染中文的字体文件."""
     font_candidates = [
         # macOS
         "/System/Library/Fonts/PingFang.ttc",
@@ -599,8 +602,10 @@ def _load_annotation_font(size: int, bold: bool = False):
         # Debian/Ubuntu with fonts-noto-cjk / fonts-wqy-zenhei
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
         "/usr/share/fonts/truetype/arphic/ukai.ttc",
         "/usr/share/fonts/truetype/arphic/uming.ttc",
         # Common Windows fonts if mounted/copied
@@ -609,16 +614,59 @@ def _load_annotation_font(size: int, bold: bool = False):
     ]
     for font_path in font_candidates:
         if Path(font_path).exists():
-            try:
-                return ImageFont.truetype(font_path, size=size)
-            except Exception:
+            return font_path
+
+    # Linux: ask fontconfig for a font that supports Chinese.
+    for query in ["Noto Sans CJK SC", "WenQuanYi Zen Hei", "Microsoft YaHei", "SimSun", "sans:lang=zh-cn"]:
+        try:
+            result = subprocess.run(
+                ["fc-match", "-f", "%{file}", query],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            font_path = result.stdout.strip()
+            if font_path and Path(font_path).exists():
+                return font_path
+        except Exception:
+            pass
+
+    # Last resort: scan common font directories for likely CJK fonts.
+    keywords = [
+        "noto", "cjk", "wqy", "wenquanyi", "sourcehans", "sourcehan",
+        "droid sans fallback", "arphic", "ukai", "uming", "simhei", "simsun", "msyh",
+    ]
+    for root in [Path("/usr/share/fonts"), Path("/usr/local/share/fonts"), Path.home() / ".fonts"]:
+        if not root.exists():
+            continue
+        for font_file in root.rglob("*"):
+            if font_file.suffix.lower() not in {".ttf", ".ttc", ".otf"}:
                 continue
+            name = font_file.name.lower()
+            if any(keyword in name for keyword in keywords):
+                return str(font_file)
+
+    return None
+
+
+def _load_annotation_font(size: int, bold: bool = False):
+    """加载支持中文的标注字体，失败时回退到Pillow默认字体."""
+    font_path = _find_chinese_font_path()
+    if font_path:
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except Exception:
+            pass
     try:
         return ImageFont.load_default(size=size)
     except TypeError:
         return ImageFont.load_default()
 
 
+def _has_chinese_annotation_font() -> bool:
+    """判断当前环境是否找到了中文字体."""
+    return _find_chinese_font_path() is not None
 def _text_size(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[int, int]:
     """兼容不同 Pillow 版本获取文本宽高."""
     try:
@@ -856,6 +904,12 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
 
     current_image = image_paths[selected_index]
     output_path = _annotated_image_output_path(doc.project_id, doc.id, current_image, selected_index)
+    font_path = _find_chinese_font_path()
+    if font_path:
+        st.caption(f"标注图字体：{font_path}")
+    else:
+        st.warning("当前服务器未找到中文字体，标注图中文可能乱码。请安装 fonts-noto-cjk 或 fonts-wqy-zenhei 后重启 Streamlit，并删除已生成的 annotated_drawings 缓存。")
+
     try:
         annotated_path = _build_review_legend_image(
             current_image,
