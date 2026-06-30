@@ -904,11 +904,6 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
 
     current_image = image_paths[selected_index]
     output_path = _annotated_image_output_path(doc.project_id, doc.id, current_image, selected_index)
-    font_path = _find_chinese_font_path()
-    if font_path:
-        st.caption(f"标注图字体：{font_path}")
-    else:
-        st.warning("当前服务器未找到中文字体，标注图中文可能乱码。请安装 fonts-noto-cjk 或 fonts-wqy-zenhei 后重启 Streamlit，并删除已生成的 annotated_drawings 缓存。")
 
     try:
         annotated_path = _build_review_legend_image(
@@ -1240,22 +1235,25 @@ def view_drawing_analysis_history(project: Project):
 
     docs = _get_drawing_documents(project)
     sessions = _drawing_sessions(project.id)
+    history_docs = [d for d in docs if d.analysis_status not in ["pending", "running"]]
 
     if not docs:
         st.info("暂无图纸文档。请先上传图纸文件。")
         return
 
-    total = len(docs)
-    analyzed = sum(1 for d in docs if d.analysis_status == "done")
-    pending = sum(1 for d in docs if d.analysis_status in ["pending", "running"])
-    failed = sum(1 for d in docs if d.analysis_status == "failed")
+    if not history_docs:
+        st.info("暂无历史分析结果。未分析的图纸不会显示在历史分析中，请到“新增分析”中发起分析或审核。")
+        return
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("总图纸数", total)
+    total = len(history_docs)
+    analyzed = sum(1 for d in history_docs if d.analysis_status == "done")
+    failed = sum(1 for d in history_docs if d.analysis_status == "failed")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("历史图纸数", total)
     col2.metric("已分析", analyzed)
-    col3.metric("待分析", pending)
-    col4.metric("分析失败", failed)
-    col5.metric("问答会话", len(sessions))
+    col3.metric("分析失败", failed)
+    col4.metric("问答会话", len(sessions))
 
     review_sessions_count = sum(1 for s in sessions if (s.title or "").startswith(REVIEW_SESSION_PREFIX))
     with st.expander("⚠️ 清理历史审核结果", expanded=False):
