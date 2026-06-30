@@ -15,6 +15,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from src.time_utils import beijing_timestamp
+
 # 优先使用技能中的客户端，否则使用项目自定义客户端
 try:
     sys.path.insert(0, str(ROOT / "skills" / "aholo-3dgs-reconstruction"))
@@ -33,7 +35,7 @@ def update_status(status_path: Path, **kwargs):
     else:
         cur = {}
     cur.update(kwargs)
-    cur["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    cur["updated_at"] = beijing_timestamp("%Y-%m-%d %H:%M:%S")
     status_path.write_text(json.dumps(cur, indent=2))
 
 
@@ -101,7 +103,7 @@ def main():
             args.status_path,
             overall_status="failed",
             error="AHOLO_API_KEY not configured. Please set it in .env file or environment variable.",
-            finished_at=time.strftime("%Y-%m-%d %H:%M:%S")
+            finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S")
         )
         print("Error: AHOLO_API_KEY not configured", file=sys.stderr)
         return 1
@@ -119,7 +121,7 @@ def main():
             mark(args.status_path, "upload", "failed", upload_result.get("error"))
             update_status(args.status_path, overall_status="failed",
                          error=f"Upload failed: {upload_result.get('error')}",
-                         finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                         finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S"))
             print(f"[{args.job_id}] Upload failed: {upload_result.get('error')}", file=sys.stderr)
             return 1
         image_url = upload_result.get("url")
@@ -143,7 +145,7 @@ def main():
                 args.status_path,
                 overall_status="failed",
                 error=f"Create task failed: {create_result.get('error')}",
-                finished_at=time.strftime("%Y-%m-%d %H:%M:%S")
+                finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S")
             )
             print(f"[{args.job_id}] Create task failed: {create_result.get('error')}", file=sys.stderr)
             return 1
@@ -191,7 +193,7 @@ def main():
                 args.status_path,
                 overall_status="failed",
                 error=f"Processing failed: {poll_result.get('error')}",
-                finished_at=time.strftime("%Y-%m-%d %H:%M:%S")
+                finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S")
             )
             print(f"[{args.job_id}] Processing failed: {poll_result.get('error')}", file=sys.stderr)
             return 1
@@ -206,7 +208,7 @@ def main():
                 args.status_path,
                 overall_status="failed",
                 error=f"Task failed with status: {task.get('status')}",
-                finished_at=time.strftime("%Y-%m-%d %H:%M:%S")
+                finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S")
             )
             print(f"[{args.job_id}] Task failed with status: {task.get('status')}", file=sys.stderr)
             return 1
@@ -279,7 +281,7 @@ def main():
         update_status(
             args.status_path,
             overall_status="done",
-            finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S"),
             world_id=world_id,
             image_url=image_url,
             viewer_url=viewer_url,
@@ -300,7 +302,7 @@ def main():
             overall_status="failed",
             error=error_msg,
             traceback=traceback_str,
-            finished_at=time.strftime("%Y-%m-%d %H:%M:%S")
+            finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S")
         )
         print(f"[{args.job_id}] Error: {error_msg}", file=sys.stderr)
         print(traceback_str, file=sys.stderr)

@@ -45,6 +45,7 @@ from views_kb import view_knowledge_base, view_chatbot, view_chat_image, view_ll
 from views_tasks import view_task_tracking
 from views_drawings import view_drawing_analysis
 from src.db import init_db
+from src.time_utils import beijing_timestamp
 init_db()
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -174,16 +175,28 @@ nav_groups = {
 if is_admin():
     nav_groups["🛠 Admin"] = ["Users", "LLM 设置"]
 
-# Flatten with group separators in the radio
-flat = []
-for g, items in nav_groups.items():
-    flat.append(("__group__", g))
-    flat.extend([("page", x) for x in items])
-labels = [x[1] if x[0] == "__group__" else f"   {x[1]}" for x in flat]
-default_label = "   Projects"
-choice = st.sidebar.radio("Navigate", labels, index=labels.index(default_label),
-                           label_visibility="collapsed")
-page = choice.strip()
+# Use one selectable row per page. Single-page groups use the group label itself
+# to avoid duplicate-looking entries such as "📂 Projects" followed by "Projects".
+nav_options = []
+page_by_label = {}
+for group_label, items in nav_groups.items():
+    if len(items) == 1:
+        nav_options.append(group_label)
+        page_by_label[group_label] = items[0]
+    else:
+        for item in items:
+            label = f"{group_label} · {item}"
+            nav_options.append(label)
+            page_by_label[label] = item
+
+default_label = "📂 Projects"
+choice = st.sidebar.radio(
+    "Navigate",
+    nav_options,
+    index=nav_options.index(default_label) if default_label in nav_options else 0,
+    label_visibility="collapsed",
+)
+page = page_by_label.get(choice, "Projects")
 
 st.sidebar.divider()
 v1_n = len(list_frames(1))
@@ -314,7 +327,7 @@ def page_upload():
                 import shutil
                 shutil.rmtree(seg_dir)
 
-            job_id = f"job_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            job_id = f"job_{beijing_timestamp()}_{uuid.uuid4().hex[:6]}"
             cmd = [
                 sys.executable, str(ROOT / "scripts" / "run_pipeline.py"),
                 "--job-id", job_id,
@@ -598,8 +611,7 @@ def page_point_cloud():
                     save_path = save_dir / uploaded.name
                     # 如果文件已存在，添加时间戳
                     if save_path.exists():
-                        from datetime import datetime
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        timestamp = beijing_timestamp()
                         name = uploaded.name.replace(".ply", f"_{timestamp}.ply")
                         save_path = save_dir / name
                         file_name = name

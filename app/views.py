@@ -7,7 +7,6 @@ import json
 import shutil
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -24,6 +23,7 @@ from src.auth import authenticate, create_user, update_password, hash_password, 
 from src.storage import documents_dir, project_dir, materials_dir, material_dir, material_slug_dir, slugify, capture_dir, jobs_dir
 from src.analyzers import run_analyzer, serialize
 from src.settings import get_setting, set_setting
+from src.time_utils import beijing_timestamp, format_beijing, now_beijing, now_utc
 
 
 # ============ session helpers ============
@@ -228,8 +228,8 @@ def view_admin_users():
         users = s.execute(select(User).order_by(User.id)).scalars().all()
         rows = [{"id": u.id, "email": u.email, "name": u.name, "role": u.role,
                  "active": u.is_active,
-                 "created": u.created_at.strftime("%Y-%m-%d %H:%M") if u.created_at else "",
-                 "last_login": u.last_login_at.strftime("%Y-%m-%d %H:%M") if u.last_login_at else "—"}
+                 "created": format_beijing(u.created_at),
+                 "last_login": format_beijing(u.last_login_at, fallback="—")}
                 for u in users]
     st.dataframe(rows, width="stretch")
 
@@ -386,7 +386,6 @@ def _run_3d_modeling(doc_id: int, project_id: int):
     """为施工照片运行3D建模（使用Aholo 3DGS API）."""
     import subprocess
     import sys
-    import time
     import uuid
 
     with session() as s:
@@ -407,7 +406,7 @@ def _run_3d_modeling(doc_id: int, project_id: int):
         return
 
     # 创建专用的3D建模任务
-    job_id = f"job_3d_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}_doc{doc_id}"
+    job_id = f"job_3d_{beijing_timestamp()}_{uuid.uuid4().hex[:4]}_doc{doc_id}"
     jdir = jobs_dir(project_id)
     jdir.mkdir(parents=True, exist_ok=True)
 
@@ -425,7 +424,7 @@ def _run_3d_modeling(doc_id: int, project_id: int):
         "project_id": project_id,
         "overall_status": "running",
         "provider": "aholo3d",
-        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "started_at": beijing_timestamp("%Y-%m-%d %H:%M:%S"),
         "stages": [
             {"name": "upload", "status": "pending"},
             {"name": "create_task", "status": "pending"},
@@ -502,7 +501,7 @@ def _proj_documents(p: Project):
                 "size_kb": round(d.size_bytes / 1024, 1),
                 "status": d.analysis_status,
                 "summary": (d.analysis_summary or "")[:160],
-                "uploaded_at": d.uploaded_at.strftime("%Y-%m-%d %H:%M") if d.uploaded_at else "",
+                "uploaded_at": format_beijing(d.uploaded_at),
             })
     for key, label in DOCUMENT_CATEGORIES:
         rows = rows_by_cat.get(key, [])
@@ -643,7 +642,7 @@ def _run_doc_analysis(doc_id: int, abs_path: Path):
         d.analysis_summary = res.get("summary", "")[:1024]
         d.analysis_data_json = serialize(res.get("data") or {})
         d.analysis_error = res.get("error")
-        d.analyzed_at = datetime.utcnow()
+        d.analyzed_at = now_utc()
         s.add(d)
 
 
@@ -778,7 +777,7 @@ def _proj_captures(p: Project):
             with st.container(border=True):
                 col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
                 col1.markdown(f"**{c.name}** · `id={c.id}`")
-                col1.caption(f"captured: {c.captured_at.strftime('%Y-%m-%d %H:%M') if c.captured_at else '—'} · "
+                col1.caption(f"captured: {format_beijing(c.captured_at, fallback='—')} · "
                              f"frames: {c.frames_count or 0}")
                 col2.markdown(f"**status:** {c.status}")
                 # Find latest job for this capture
@@ -790,7 +789,7 @@ def _proj_captures(p: Project):
                         break
                 if col3.button("Run pipeline", key=f"run_{c.id}",
                                disabled=(c.status == "processing")):
-                    job_id = f"job_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}_cap{c.id}"
+                    job_id = f"job_{beijing_timestamp()}_{uuid.uuid4().hex[:4]}_cap{c.id}"
                     cmd = [
                         sys.executable, str(Path(__file__).resolve().parent.parent / "scripts" / "run_pipeline.py"),
                         "--job-id", job_id,
@@ -831,7 +830,7 @@ def _proj_captures(p: Project):
     st.subheader("Add new capture (upload video)")
     with st.form("new_capture", clear_on_submit=True):
         c1, c2 = st.columns([2, 1])
-        with c1: cap_name = st.text_input("Capture name", value=f"Capture {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        with c1: cap_name = st.text_input("Capture name", value=f"Capture {now_beijing().strftime('%Y-%m-%d %H:%M')}")
         with c2: notes = st.text_input("Notes (optional)")
         video = st.file_uploader("Video (mp4 / mov)", type=["mp4", "mov", "MOV", "MP4", "m4v", "mkv"])
         run_now = st.checkbox("Run pipeline immediately after upload", value=True)
@@ -853,8 +852,8 @@ def _proj_captures(p: Project):
             c.outputs_dir = f"captures/{cid}/outputs"
             s.add(c)
         if run_now:
-            import subprocess, sys, time, uuid
-            job_id = f"job_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}_cap{cid}"
+            import subprocess, sys, uuid
+            job_id = f"job_{beijing_timestamp()}_{uuid.uuid4().hex[:4]}_cap{cid}"
             cmd = [
                 sys.executable, str(Path(__file__).resolve().parent.parent / "scripts" / "run_pipeline.py"),
                 "--job-id", job_id,
@@ -927,7 +926,7 @@ def _proj_settings(p: Project):
         for m in ms:
             uu = s.get(User, m.user_id)
             member_rows.append({"user": uu.email, "role": m.role,
-                                "added": m.added_at.strftime("%Y-%m-%d") if m.added_at else ""})
+                                "added": format_beijing(m.added_at, "%Y-%m-%d") if m.added_at else ""})
     if member_rows:
         st.dataframe(member_rows, width="stretch", hide_index=True)
     else:

@@ -4,7 +4,6 @@ Single import surface — `from src.db import init_db, session, User, Project, .
 """
 from __future__ import annotations
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import (
@@ -12,6 +11,8 @@ from sqlalchemy import (
     ForeignKey, create_engine, UniqueConstraint, Index,
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
+
+from .time_utils import now_utc
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = ROOT / "data"
@@ -29,7 +30,7 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(String(32), nullable=False, default="user")  # 'admin' | 'user'
     is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
     last_login_at = Column(DateTime, nullable=True)
 
     owned_projects = relationship("Project", back_populates="owner",
@@ -48,7 +49,7 @@ class Project(Base):
     status = Column(String(32), nullable=False, default="planning")
     # 'planning' | 'in_progress' | 'completed' | 'archived'
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
 
     owner = relationship("User", back_populates="owned_projects",
                          foreign_keys=[owner_id])
@@ -88,7 +89,7 @@ class ProjectMember(Base):
     user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
     role = Column(String(32), nullable=False, default="viewer")
     # 'viewer' | 'editor' | 'owner'
-    added_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    added_at = Column(DateTime, default=now_utc, nullable=False)
 
     project = relationship("Project", back_populates="members")
     user = relationship("User", back_populates="memberships")
@@ -99,7 +100,7 @@ class Capture(Base):
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     name = Column(String(255), nullable=False)
-    captured_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    captured_at = Column(DateTime, default=now_utc, nullable=False)
     captured_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     notes = Column(Text, nullable=True)
     status = Column(String(32), nullable=False, default="uploaded")
@@ -108,7 +109,7 @@ class Capture(Base):
     frames_dir = Column(String(512), nullable=True)
     frames_count = Column(Integer, nullable=True)
     outputs_dir = Column(String(512), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
 
     project = relationship("Project", back_populates="captures")
 
@@ -129,7 +130,7 @@ class Material(Base):
     price = Column(Float, nullable=True)
     notes = Column(Text, nullable=True)
     images_dir = Column(String(512), nullable=False)  # rel to project dir
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
 
     project = relationship("Project", back_populates="materials")
 
@@ -145,7 +146,7 @@ class Document(Base):
     size_bytes = Column(Integer, nullable=False)
     mime_type = Column(String(128), nullable=True)
     uploaded_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    uploaded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    uploaded_at = Column(DateTime, default=now_utc, nullable=False)
 
     # Analysis state
     analysis_status = Column(String(32), nullable=False, default="pending")
@@ -177,7 +178,7 @@ class DocumentChunk(Base):
     page_num = Column(Integer, nullable=True)    # For PDFs, PPTX, etc.
     char_start = Column(Integer, nullable=True)
     char_end = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
 
     document = relationship("Document")
 
@@ -189,8 +190,8 @@ class ChatSession(Base):
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     title = Column(String(255), nullable=True)  # Auto-generated from first message
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
+    updated_at = Column(DateTime, default=now_utc, nullable=False)
 
     messages = relationship("ChatMessage", back_populates="session",
                             cascade="all, delete-orphan")
@@ -207,7 +208,7 @@ class ChatMessage(Base):
     content = Column(Text, nullable=False)
     context_chunk_ids = Column(Text, nullable=True)  # JSON list of chunk IDs used
     images = Column(Text, nullable=True)  # JSON list of image paths (rel to data/)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
 
     session = relationship("ChatSession", back_populates="messages")
 
@@ -223,7 +224,7 @@ class Analysis(Base):
     status = Column(String(32), nullable=False, default="pending")
     report_path = Column(String(1024), nullable=True)
     summary = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
     finished_at = Column(DateTime, nullable=True)
 
     project = relationship("Project", back_populates="analyses")
@@ -257,8 +258,8 @@ class Task(Base):
     # 'low' | 'medium' | 'high' | 'urgent'
     created_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     assigned_to_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc, nullable=False)
     due_date = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
 
@@ -285,7 +286,7 @@ class TaskSnapshot(Base):
     file_path = Column(String(512), nullable=False)  # 相对路径
     file_size = Column(Integer, nullable=True)
     taken_at = Column(DateTime, nullable=True)  # 照片拍摄时间
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
     created_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
     task = relationship("Task", back_populates="snapshots")
@@ -300,7 +301,7 @@ class TaskAnalysis(Base):
     images_used = Column(Text, nullable=True)  # JSON: 使用的图片路径列表
     base_image = Column(String(512), nullable=True)  # 基准图路径
     compare_image = Column(String(512), nullable=True)  # 对比图路径
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
 
     task = relationship("Task", back_populates="analyses")
 

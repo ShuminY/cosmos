@@ -1,12 +1,12 @@
 """Password hashing + login verification + user creation helpers."""
 from __future__ import annotations
-from datetime import datetime
 from typing import Optional
 
 import bcrypt
 from sqlalchemy import select
 
 from .db import session, User
+from .time_utils import now_utc
 
 
 def hash_password(password: str) -> str:
@@ -32,7 +32,7 @@ def authenticate(email: str, password: str) -> Optional[User]:
             return None
         if not verify_password(password, u.password_hash):
             return None
-        u.last_login_at = datetime.utcnow()
+        u.last_login_at = now_utc()
         s.add(u)
         # Detach so caller can use post-session
         s.commit()

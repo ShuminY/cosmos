@@ -15,6 +15,7 @@ from src.chatbot import (
     get_available_providers, get_default_provider, set_default_provider,
     load_provider_config, save_provider_config, simple_chat_image, get_image_messages,
 )
+from src.time_utils import beijing_timestamp, format_beijing
 
 init_db()
 
@@ -98,7 +99,7 @@ def view_knowledge_base():
             "分类": doc.category,
             "KB状态": doc.kb_status,
             "文本块数": str(doc.kb_chunk_count) if doc.kb_chunk_count else "-",
-            "KB索引时间": doc.kb_indexed_at.strftime("%Y-%m-%d %H:%M") if doc.kb_indexed_at else "-",
+            "KB索引时间": format_beijing(doc.kb_indexed_at, fallback="-"),
             "KB错误": doc.kb_error or "-",
             "id": doc.id,
         })
@@ -403,14 +404,13 @@ def view_chat_image():
     if user_input or st.session_state["img_uploaded_files"]:
         if st.session_state["img_uploaded_files"]:
             # Save images to disk
-            import time
             from src.storage import project_dir
             chat_img_dir = project_dir(project.id) / "chat_images"
             chat_img_dir.mkdir(parents=True, exist_ok=True)
 
             saved_paths = []
             for f in st.session_state["img_uploaded_files"]:
-                ts = time.strftime("%Y%m%d_%H%M%S")
+                ts = beijing_timestamp()
                 save_path = chat_img_dir / f"{ts}_{f.name}"
                 save_path.write_bytes(f.getbuffer())
                 saved_paths.append(str(save_path))

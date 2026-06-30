@@ -10,7 +10,6 @@ Usage:
 from __future__ import annotations
 import shutil
 import sys
-from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +20,7 @@ from sqlalchemy import select
 from src.db import init_db, session, Project, Capture, Material, ProjectMember
 from src.auth import ensure_default_admin
 from src.storage import project_dir, materials_dir, slugify
+from src.time_utils import now_utc
 
 
 def main():
@@ -79,7 +79,7 @@ def main():
         with session() as s:
             c = Capture(
                 project_id=pid, name=name,
-                captured_at=datetime.utcnow(),
+                captured_at=now_utc(),
                 captured_by_id=admin.id,
                 status="done" if outputs_abs.exists() else "uploaded",
                 frames_count=n_frames,

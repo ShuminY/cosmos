@@ -9,13 +9,13 @@ Uses:
 from __future__ import annotations
 import json
 import io
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from sqlalchemy import select
 
 from .db import session, Document, DocumentChunk, Project
+from .time_utils import now_utc
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -286,7 +286,7 @@ def index_document(doc_id: int) -> tuple[bool, str | None]:
             # Update document status
             doc = s.get(Document, doc_id)
             doc.kb_status = "indexed"
-            doc.kb_indexed_at = datetime.utcnow()
+            doc.kb_indexed_at = now_utc()
             doc.kb_chunk_count = len(chunks)
             doc.kb_error = None
             s.add(doc)

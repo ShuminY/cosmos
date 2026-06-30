@@ -1,14 +1,16 @@
 """图纸分析视图 - 查看历史图纸分析和新增图纸分析。"""
 from __future__ import annotations
+import base64
 import html
 import json
 import re
-from datetime import datetime
 from pathlib import Path, PurePosixPath
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 
 import streamlit as st
+import streamlit.components.v1 as components
+from PIL import Image, ImageDraw, ImageFont
 
 # PDF处理依赖：优先使用 PyMuPDF，避免本地环境必须安装 Poppler
 try:
@@ -30,6 +32,7 @@ from src.chatbot import (
 )
 from src.db import session, ChatSession, Document, Project
 from src.storage import documents_dir, project_dir
+from src.time_utils import beijing_timestamp, format_beijing, now_utc
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
@@ -51,7 +54,7 @@ def _save_uploaded_drawing(project_id: int, uploaded_file) -> int:
     if dest.exists():
         stem = dest.stem
         suffix = dest.suffix
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = beijing_timestamp()
         dest = target_dir / f"{stem}_{timestamp}{suffix}"
     dest.write_bytes(uploaded_file.getbuffer())
 
@@ -323,6 +326,8 @@ def _format_review_prompt(doc: Document, rules: list[dict], custom_prompt: str) 
 ## 标准提疑
 命中问题必须用表格输出，且表头固定为：规则编号｜部位｜问题描述｜涉及图纸｜严重程度｜建议｜可信度。
 
+特别要求：如果审核对象是多页 PDF，所有可定位到具体页面的问题，必须在“部位”字段开头写明页码，格式优先使用“第N页：具体部位/轴线/区域”，例如“第3页：客厅吊顶节点”；如果无法判断页码，写“页码未明确，需人工定位：具体部位”。
+
 字段要求：
 - 规则编号：引用规则库中的规则编号。
 - 部位：填写图纸中可识别的问题位置、房间、轴线、立面、节点、页码或区域；无法确认时写“图纸未明确，需人工定位”。
@@ -341,7 +346,7 @@ def _format_review_prompt(doc: Document, rules: list[dict], custom_prompt: str) 
 要求：
 1. 只能基于当前图纸图片可见内容和规则库判断，不要编造看不清的信息。
 2. 如果单张图纸无法完成跨专业比对，应标记为“信息不足/需补图”，不要直接判定通过。
-3. 每条疑点必须引用规则编号，并严格使用“标准提疑”的七列格式：[规则编号|部位|问题描述|涉及图纸|严重程度|建议|可信度]。
+3. 每条疑点必须引用规则编号，并严格使用“标准提疑”的七列格式：[规则编号|部位|问题描述|涉及图纸|严重程度|建议|可信度]；多页 PDF 的“部位”字段必须尽量以“第N页：”开头。
 4. 如果没有可确认命中的提疑，也要输出“标准提疑”表格，并在问题描述中写“未发现可确认提疑，需结合完整图纸人工复核”。
 5. 输出中文。{extra}
 """.strip()
@@ -584,6 +589,385 @@ def _render_review_items_table(items: list[dict]):
     st.markdown(table_html, unsafe_allow_html=True)
 
 
+def _load_annotation_font(size: int, bold: bool = False):
+    """加载支持中文的标注字体，失败时回退到Pillow默认字体."""
+    font_candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+    ]
+    for font_path in font_candidates:
+        if Path(font_path).exists():
+            try:
+                return ImageFont.truetype(font_path, size=size)
+            except Exception:
+                continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _text_size(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[int, int]:
+    """兼容不同 Pillow 版本获取文本宽高."""
+    try:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        return bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except Exception:
+        return draw.textsize(text, font=font)
+
+
+def _wrap_text_for_draw(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
+    """按绘制宽度为中英文混排文本换行."""
+    text = str(text or "").strip()
+    if not text:
+        return [""]
+
+    lines = []
+    current = ""
+    for char in text:
+        trial = current + char
+        width, _ = _text_size(draw, trial, font)
+        if current and width > max_width:
+            lines.append(current)
+            current = char
+        else:
+            current = trial
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _review_severity_color(severity: str) -> tuple[int, int, int]:
+    """根据严重程度返回图例颜色."""
+    text = str(severity or "").strip()
+    if "高" in text or "严重" in text:
+        return (220, 38, 38)
+    if "中" in text:
+        return (245, 158, 11)
+    if "低" in text:
+        return (37, 99, 235)
+    return (107, 114, 128)
+
+
+def _annotated_image_output_path(project_id: int, doc_id: int, image_path: Path, page_index: int) -> Path:
+    """返回自动图例标注图的输出路径."""
+    output_dir = Path("data") / "projects" / str(project_id) / "annotated_drawings" / str(doc_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_stem = re.sub(r"[^\w\-.一-鿿]+", "_", image_path.stem).strip("_") or f"page_{page_index + 1:03d}"
+    return output_dir / f"{safe_stem}_审核标注_{page_index + 1:03d}.png"
+
+
+def _review_item_text_for_page_match(item: dict) -> str:
+    """拼接可用于识别页码的审核提疑文本."""
+    return " ".join(
+        str(item.get(col, ""))
+        for col in ["部位", "涉及图纸", "问题描述"]
+        if item.get(col)
+    )
+
+
+def _extract_review_item_pages(item: dict, total_pages: int) -> set[int]:
+    """从审核提疑文本中提取 1-based 页码集合."""
+    text = _review_item_text_for_page_match(item)
+    if not text:
+        return set()
+
+    pages: set[int] = set()
+    patterns = [
+        r"第\s*(\d{1,3})\s*页",
+        r"page\s*(\d{1,3})\b",
+        r"p\.?\s*(\d{1,3})\b",
+        r"页码\s*[:：]?\s*(\d{1,3})\b",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            page = int(match.group(1))
+            if 1 <= page <= total_pages:
+                pages.add(page)
+
+    # 兼容转换图文件名或模型引用的 page_001 / page-001 / page 001
+    for match in re.finditer(r"page[_\-\s]*(\d{1,3})\b", text, flags=re.IGNORECASE):
+        page = int(match.group(1))
+        if 1 <= page <= total_pages:
+            pages.add(page)
+
+    return pages
+
+
+def _split_review_items_for_page(review_items: list[dict], page_number: int, total_pages: int) -> tuple[list[dict], list[dict]]:
+    """按页码拆分当前页提疑和未识别页码提疑."""
+    if total_pages <= 1:
+        return review_items, []
+
+    current_page_items = []
+    unknown_page_items = []
+    for item in review_items:
+        pages = _extract_review_item_pages(item, total_pages)
+        if page_number in pages:
+            current_page_items.append(item)
+        elif not pages:
+            unknown_page_items.append(item)
+    return current_page_items, unknown_page_items
+
+
+def _review_page_match_summary(review_items: list[dict], total_pages: int) -> dict[int, int]:
+    """统计每页可识别到的审核提疑数量."""
+    summary = {page: 0 for page in range(1, total_pages + 1)}
+    for item in review_items:
+        for page in _extract_review_item_pages(item, total_pages):
+            summary[page] += 1
+    return summary
+
+
+def _build_review_legend_image(image_path: Path, review_items: list[dict], output_path: Path, page_number: int | None = None) -> Path:
+    """在图纸右侧扩展当前页审核问题编号图例，并保存为PNG."""
+    with Image.open(image_path) as source:
+        base_img = source.convert("RGB")
+
+    width, height = base_img.size
+    sidebar_width = max(420, min(720, max(width // 2, 1)))
+    padding = 24
+    item_gap = 18
+    title_font = _load_annotation_font(max(24, min(40, width // 45)))
+    body_font = _load_annotation_font(max(18, min(28, width // 70)))
+    small_font = _load_annotation_font(max(15, min(22, width // 90)))
+
+    annotated = Image.new("RGB", (width + sidebar_width, height), "white")
+    annotated.paste(base_img, (0, 0))
+    draw = ImageDraw.Draw(annotated)
+
+    # 分隔线与标题
+    draw.rectangle([width, 0, width + 2, height], fill=(229, 231, 235))
+    title = f"第 {page_number} 页审核问题" if page_number else "审核问题图例"
+    draw.text((width + padding, padding), title, fill=(17, 24, 39), font=title_font)
+    _, title_h = _text_size(draw, title, title_font)
+    y = padding + title_h + 22
+
+    if not review_items:
+        note = "本页暂无可匹配到页码的审核问题。"
+        for line in _wrap_text_for_draw(draw, note, body_font, sidebar_width - padding * 2):
+            draw.text((width + padding, y), line, fill=(107, 114, 128), font=body_font)
+            _, line_h = _text_size(draw, line, body_font)
+            y += line_h + 8
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        annotated.save(output_path, format="PNG")
+        return output_path
+
+    max_text_width = sidebar_width - padding * 2 - 52
+    visible_count = 0
+    for idx, item in enumerate(review_items, start=1):
+        severity = item.get("严重程度", "") or "待复核"
+        color = _review_severity_color(severity)
+        rule_id = item.get("规则编号", "") or "未编号"
+        location = item.get("部位", "") or "部位未明确"
+        description = item.get("问题描述", "") or "问题描述为空"
+        header = f"{idx}. [{rule_id}] {severity}"
+        detail = f"部位：{location}；问题：{description}"
+
+        header_lines = _wrap_text_for_draw(draw, header, body_font, max_text_width)
+        detail_lines = _wrap_text_for_draw(draw, detail, small_font, max_text_width)
+        _, body_h = _text_size(draw, "国", body_font)
+        _, small_h = _text_size(draw, "国", small_font)
+        item_height = max(34, len(header_lines) * (body_h + 4) + min(3, len(detail_lines)) * (small_h + 4)) + item_gap
+
+        if y + item_height > height - padding:
+            remaining = len(review_items) - visible_count
+            if remaining > 0:
+                note = f"本页其余 {remaining} 条请查看下方审核表格。"
+                note_lines = _wrap_text_for_draw(draw, note, small_font, sidebar_width - padding * 2)
+                note_y = max(y, height - padding - len(note_lines) * (small_h + 4) - 8)
+                for line in note_lines:
+                    draw.text((width + padding, note_y), line, fill=(107, 114, 128), font=small_font)
+                    note_y += small_h + 4
+            break
+
+        circle_x = width + padding + 16
+        circle_y = y + 15
+        draw.ellipse([circle_x - 15, circle_y - 15, circle_x + 15, circle_y + 15], fill=color, outline=(31, 41, 55), width=2)
+        number_text = str(idx)
+        num_w, num_h = _text_size(draw, number_text, small_font)
+        draw.text((circle_x - num_w / 2, circle_y - num_h / 2 - 1), number_text, fill="white", font=small_font)
+
+        text_x = width + padding + 44
+        text_y = y
+        for line in header_lines:
+            draw.text((text_x, text_y), line, fill=(17, 24, 39), font=body_font)
+            text_y += body_h + 4
+        for line in detail_lines[:3]:
+            draw.text((text_x, text_y), line, fill=(55, 65, 81), font=small_font)
+            text_y += small_h + 4
+        if len(detail_lines) > 3:
+            draw.text((text_x, text_y), "…", fill=(107, 114, 128), font=small_font)
+
+        y += item_height
+        visible_count += 1
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    annotated.save(output_path, format="PNG")
+    return output_path
+
+
+def _render_review_legend_images(doc: Document, review_items: list[dict], analysis_data: dict):
+    """渲染当前页审核结果自动图例标注图，并提供PNG下载."""
+    image_paths = []
+    for raw_path in analysis_data.get("preprocessed_images", []):
+        path = Path(raw_path)
+        if path.exists():
+            image_paths.append(path)
+
+    if not image_paths:
+        st.info("暂无可生成标注图的预处理图片。请重新执行图纸审核以生成图片预处理结果。")
+        return
+
+    total_pages = len(image_paths)
+    page_summary = _review_page_match_summary(review_items, total_pages)
+
+    selected_index = 0
+    if total_pages > 1:
+        selected_index = st.selectbox(
+            "选择标注图页码",
+            range(total_pages),
+            format_func=lambda i: f"第 {i + 1} 页 · 已匹配 {page_summary.get(i + 1, 0)} 条 · {image_paths[i].name}",
+            key=f"review_legend_page_{doc.id}",
+        )
+
+    page_number = selected_index + 1
+    current_page_items, unknown_page_items = _split_review_items_for_page(review_items, page_number, total_pages)
+    if total_pages > 1:
+        st.caption(
+            f"当前第 {page_number} 页：显示 {len(current_page_items)} 条已明确匹配到本页的审核问题；"
+            f"{len(unknown_page_items)} 条未识别页码的问题未标到具体页面。"
+        )
+        if unknown_page_items:
+            with st.expander(f"查看未识别页码的问题（{len(unknown_page_items)} 条）", expanded=False):
+                _render_review_items_table(unknown_page_items)
+
+    current_image = image_paths[selected_index]
+    output_path = _annotated_image_output_path(doc.project_id, doc.id, current_image, selected_index)
+    try:
+        annotated_path = _build_review_legend_image(
+            current_image,
+            current_page_items,
+            output_path,
+            page_number=page_number,
+        )
+    except Exception as e:
+        st.error(f"生成审核标注图失败: {e}")
+        return
+
+    _render_full_resolution_image(
+        annotated_path,
+        f"第 {page_number} 页审核问题图例标注图",
+        key=f"review_legend_image_{doc.id}_{selected_index}",
+    )
+    st.download_button(
+        label="🖼️ 下载当前页标注图 PNG",
+        data=annotated_path.read_bytes(),
+        file_name=f"{Path(doc.filename).stem}_审核标注_page{page_number:03d}.png",
+        mime="image/png",
+        key=f"download_review_legend_{doc.id}_{selected_index}",
+    )
+
+
+def _render_full_resolution_image(image_path: Path, caption: str, key: str):
+    """先显示缩略图，并提供新标签页查看原图入口."""
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+    except Exception:
+        st.image(str(image_path), caption=caption, width="stretch")
+        return
+
+    st.image(str(image_path), caption=f"{caption}（缩略图）", width="stretch")
+    data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    safe_key = re.sub(r"[^a-zA-Z0-9_-]", "_", key)
+    components.html(
+        f"""
+<button id="open-{safe_key}" style="
+    padding:0.45rem 0.75rem;
+    border:1px solid #d1d5db;
+    border-radius:0.5rem;
+    color:#111827;
+    background:#ffffff;
+    font-size:0.95rem;
+    cursor:pointer;
+">🔎 查看原图（{width} × {height}px）</button>
+<script>
+(function() {{
+  const button = document.getElementById('open-{safe_key}');
+  const base64 = '{data}';
+  button.addEventListener('click', function() {{
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {{
+      bytes[i] = binary.charCodeAt(i);
+    }}
+    const blob = new Blob([bytes], {{ type: 'image/png' }});
+    const url = URL.createObjectURL(blob);
+    window.open(url, '_blank', 'noopener,noreferrer');
+  }});
+}})();
+</script>
+""",
+        height=46,
+    )
+
+
+def _markdown_table_cell(value: object) -> str:
+    """清理 Markdown 表格单元格内容，避免导出表格断列."""
+    return str(value or "").replace("|", "\\|").replace("\n", "<br>")
+
+
+
+def _export_review_as_markdown(doc: Document, review_items: list[dict]) -> str:
+    """生成审核结果 Markdown 导出内容."""
+    lines = []
+    lines.append("# 图纸审核报告")
+    lines.append("")
+    lines.append(f"**图纸文件:** {doc.filename}")
+    lines.append(f"**项目 ID:** {doc.project_id}")
+    if doc.analyzed_at:
+        lines.append(f"**审核时间:** {format_beijing(doc.analyzed_at, '%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+
+    if review_items:
+        lines.append("## 审核提疑汇总")
+        lines.append("")
+        lines.append("| 规则编号 | 部位 | 问题描述 | 涉及图纸 | 严重程度 | 建议 | 可信度 |")
+        lines.append("|----------|------|----------|----------|----------|------|--------|")
+        for item in review_items:
+            cells = [
+                _markdown_table_cell(item.get("规则编号", "")),
+                _markdown_table_cell(item.get("部位", "")),
+                _markdown_table_cell(item.get("问题描述", "")),
+                _markdown_table_cell(item.get("涉及图纸", "")),
+                _markdown_table_cell(item.get("严重程度", "")),
+                _markdown_table_cell(item.get("建议", "")),
+                _markdown_table_cell(item.get("可信度", "")),
+            ]
+            lines.append(f"| {' | '.join(cells)} |")
+        lines.append("")
+
+    lines.append("## 完整审核原文")
+    lines.append("")
+    lines.append(doc.analysis_summary or "")
+    return "\n".join(lines)
+
+
+def _export_review_as_csv(review_items: list[dict]) -> str:
+    """生成审核提疑 CSV 导出内容."""
+    columns = ["规则编号", "部位", "问题描述", "涉及图纸", "严重程度", "建议", "可信度"]
+    lines = [",".join(f'"{col}"' for col in columns)]
+    for item in review_items:
+        cells = []
+        for col in columns:
+            value = str(item.get(col, "")).replace('"', '""')
+            cells.append(f'"{value}"')
+        lines.append(",".join(cells))
+    return "﻿" + "\n".join(lines)
+
+
 def _render_document_result(doc: Document):
     """按类型渲染文档分析/审核结果."""
     analysis_data = _parse_analysis_data(doc)
@@ -596,12 +980,67 @@ def _render_document_result(doc: Document):
             _render_review_items_table(review_items)
             with st.expander("查看审核原文", expanded=False):
                 st.write(doc.analysis_summary)
+
+            with st.expander("🖼️ 查看审核标注图", expanded=False):
+                st.caption("自动在图纸右侧生成审核问题编号图例；编号与下方标准提疑表顺序一致。")
+                _render_review_legend_images(doc, review_items, analysis_data)
+
+            # 导出功能区域
+            st.divider()
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                # 导出 Markdown
+                md_content = _export_review_as_markdown(doc, review_items)
+                timestamp = format_beijing(doc.analyzed_at, '%Y%m%d_%H%M%S') if doc.analyzed_at else "export"
+                filename_md = f"{Path(doc.filename).stem}_审核结果_{timestamp}.md"
+                st.download_button(
+                    label="📄 导出 Markdown",
+                    data=md_content,
+                    file_name=filename_md,
+                    mime="text/markdown",
+                    key=f"export_md_{doc.id}",
+                )
+            with col2:
+                # 导出 CSV 提疑表格
+                csv_content = _export_review_as_csv(review_items)
+                filename_csv = f"{Path(doc.filename).stem}_审核提疑_{timestamp}.csv"
+                st.download_button(
+                    label="📊 导出 CSV 提疑表",
+                    data=csv_content,
+                    file_name=filename_csv,
+                    mime="text/csv",
+                    key=f"export_csv_{doc.id}",
+                )
         else:
             st.info("未能从审核结果中解析出标准提疑表格，以下展示审核原文。")
             st.write(doc.analysis_summary)
+            # 仍然提供导出原文为 Markdown
+            st.divider()
+            md_content = _export_review_as_markdown(doc, [])
+            timestamp = format_beijing(doc.analyzed_at, '%Y%m%d_%H%M%S') if doc.analyzed_at else "export"
+            filename_md = f"{Path(doc.filename).stem}_审核结果_{timestamp}.md"
+            st.download_button(
+                label="📄 导出 Markdown 原文",
+                data=md_content,
+                file_name=filename_md,
+                mime="text/markdown",
+                key=f"export_md_raw_{doc.id}",
+            )
     else:
         st.subheader("📝 分析摘要")
         st.write(doc.analysis_summary)
+        # 普通分析也支持导出
+        st.divider()
+        md_content = f"# 图纸分析报告\n\n**图纸文件:** {doc.filename}\n\n## 分析摘要\n\n{doc.analysis_summary or ''}"
+        timestamp = format_beijing(doc.analyzed_at, '%Y%m%d_%H%M%S') if doc.analyzed_at else "export"
+        filename_md = f"{Path(doc.filename).stem}_分析结果_{timestamp}.md"
+        st.download_button(
+            label="📄 导出 Markdown",
+            data=md_content,
+            file_name=filename_md,
+            mime="text/markdown",
+            key=f"export_md_analysis_{doc.id}",
+        )
 
     chat_session_id = analysis_data.get("chat_session_id")
     if chat_session_id:
@@ -627,7 +1066,7 @@ def _save_doc_analysis_result(doc_id: int, answer: str, data: dict):
             doc_db.analysis_summary = answer
             doc_db.analysis_data_json = json.dumps(data, ensure_ascii=False, indent=2)
             doc_db.analysis_error = None
-            doc_db.analyzed_at = datetime.utcnow()
+            doc_db.analyzed_at = now_utc()
             s.commit()
 
 
@@ -795,13 +1234,13 @@ def view_drawing_analysis_history(project: Project):
             col_a, col_b = st.columns([3, 1])
 
             with col_a:
-                upload_time = doc.uploaded_at.strftime("%Y-%m-%d %H:%M:%S") if doc.uploaded_at else "未知"
+                upload_time = format_beijing(doc.uploaded_at, '%Y-%m-%d %H:%M:%S', fallback="未知")
                 st.markdown(f"**文件名:** {doc.filename}")
                 st.markdown(f"**上传时间:** {upload_time}")
                 st.markdown(f"**文件大小:** {doc.size_bytes / 1024:.1f} KB")
                 st.markdown(f"**分析状态:** {status_text}")
                 if doc.analyzed_at:
-                    st.markdown(f"**分析时间:** {doc.analyzed_at.strftime('%Y-%m-%d %H:%M:%S')}")
+                    st.markdown(f"**分析时间:** {format_beijing(doc.analyzed_at, '%Y-%m-%d %H:%M:%S')}")
 
             with col_b:
                 _display_preview(project.id, doc, width=200)
@@ -907,7 +1346,7 @@ def view_new_drawing_analysis(project: Project):
     col1, col2 = st.columns([1, 1])
 
     with col1:
-        upload_time = selected_doc.uploaded_at.strftime("%Y-%m-%d %H:%M:%S") if selected_doc.uploaded_at else "未知"
+        upload_time = format_beijing(selected_doc.uploaded_at, '%Y-%m-%d %H:%M:%S', fallback="未知")
         st.markdown(f"**文件名:** {selected_doc.filename}")
         st.markdown(f"**上传时间:** {upload_time}")
         st.markdown(f"**文件大小:** {selected_doc.size_bytes / 1024:.1f} KB")
@@ -1032,7 +1471,7 @@ def view_drawing_analysis_chat(project: Project):
             "选择图纸分析会话",
             sessions,
             index=default_idx,
-            format_func=lambda s: f"{s.title or '图纸分析'} · {s.updated_at.strftime('%Y-%m-%d %H:%M')}",
+            format_func=lambda s: f"{s.title or '图纸分析'} · {format_beijing(s.updated_at, '%Y-%m-%d %H:%M')}",
             key="drawing_chat_session_selector",
         )
         st.session_state["drawing_analysis_session_id"] = selected_session.id

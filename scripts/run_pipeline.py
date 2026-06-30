@@ -16,7 +16,6 @@ import json
 import subprocess
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,7 +25,7 @@ from src.db import session, init_db, Project, Capture, Job
 from src.storage import (
     project_dir, capture_dir, materials_dir, jobs_dir, slugify,
 )
-
+from src.time_utils import beijing_timestamp
 
 STAGES = ["extract_frames", "reconstruct", "segment", "recrop_masks", "match_references", "summarize"]
 
@@ -34,7 +33,7 @@ STAGES = ["extract_frames", "reconstruct", "segment", "recrop_masks", "match_ref
 def update_status(status_path: Path, **kwargs):
     cur = json.loads(status_path.read_text()) if status_path.exists() else {}
     cur.update(kwargs)
-    cur["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    cur["updated_at"] = beijing_timestamp("%Y-%m-%d %H:%M:%S")
     tmp = status_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(cur, indent=2))
     tmp.replace(status_path)
@@ -107,7 +106,7 @@ def main():
                   project_id=args.project_id, capture_id=args.capture_id,
                   stages=[{"name": s, "status": "pending"} for s in STAGES],
                   overall_status="running",
-                  started_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                  started_at=beijing_timestamp("%Y-%m-%d %H:%M:%S"))
 
     def mark(stage, status, msg=""):
         cur = json.loads(status_path.read_text())
@@ -231,7 +230,7 @@ def main():
         mark("summarize", "done")
 
         update_status(status_path, overall_status="done",
-                      finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                      finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S"))
         set_cap_status("done")
         return 0
     except Exception as e:

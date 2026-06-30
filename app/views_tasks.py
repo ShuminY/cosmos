@@ -18,6 +18,7 @@ import json
 
 from src.db import session, Task, TaskSnapshot, TaskAnalysis, Project, User
 from src.storage import project_dir
+from src.time_utils import beijing_timestamp, format_beijing, now_beijing, now_utc
 
 
 def view_task_tracking(project: Project):
@@ -163,7 +164,7 @@ def _task_detail(task: Task, project: Project):
         st.markdown(f"**描述:** {task.description or '无描述'}")
         st.markdown(f"**状态:** {_format_status(task.status)}")
         st.markdown(f"**优先级:** {_format_priority(task.priority)}")
-        st.markdown(f"**创建时间:** {task.created_at.strftime('%Y-%m-%d %H:%M')}")
+        st.markdown(f"**创建时间:** {format_beijing(task.created_at)}")
         if task.due_date:
             st.markdown(f"**截止日期:** {task.due_date.strftime('%Y-%m-%d')}")
 
@@ -229,7 +230,7 @@ def _task_detail(task: Task, project: Project):
         base_title = Path(latest_analysis.base_image).stem if latest_analysis.base_image else "初始"
         compare_title = Path(latest_analysis.compare_image).stem if latest_analysis.compare_image else "最新"
         with st.container(border=True):
-            st.caption(f"📊 **最近分析**（{latest_analysis.created_at.strftime('%m-%d %H:%M')}）基准: {base_title} | 对比: {compare_title}")
+            st.caption(f"📊 **最近分析**（{format_beijing(latest_analysis.created_at, '%m-%d %H:%M')}）基准: {base_title} | 对比: {compare_title}")
             st.markdown(latest_analysis.result)
 
     if task.snapshots:
@@ -239,7 +240,7 @@ def _task_detail(task: Task, project: Project):
                 snapshot_path = project_dir(project.id) / snapshot.file_path
                 if snapshot_path.exists():
                     st.image(str(snapshot_path), caption=snapshot.title, width="stretch")
-                    st.caption(f"📅 {snapshot.created_at.strftime('%Y-%m-%d %H:%M')} · 📁 {snapshot.title}")
+                    st.caption(f"📅 {format_beijing(snapshot.created_at)} · 📁 {snapshot.title}")
                 else:
                     st.error(f"文件不存在: {snapshot.title}")
     else:
@@ -250,7 +251,7 @@ def _task_detail(task: Task, project: Project):
         st.markdown("---")
         st.caption(f"📋 全部历史分析记录（{len(task.analyses)} 条）")
         for analysis in task.analyses[:-1]:  # 最新的已经在上面显示了
-            label = f"📊 #{analysis.id} — {analysis.created_at.strftime('%m-%d %H:%M')}"
+            label = f"📊 #{analysis.id} — {format_beijing(analysis.created_at, '%m-%d %H:%M')}"
             if analysis.base_image:
                 label += f"  ({Path(analysis.base_image).stem} → {Path(analysis.compare_image).stem})"
             with st.expander(label, expanded=False):
@@ -273,7 +274,7 @@ def _add_snapshot_form(task: Task, project: Project):
                 "final": "✅ 完成状态",
             }.get(x, x),
         )
-        title = st.text_input("照片标题", value=f"进度更新 {datetime.now().strftime('%m-%d')}")
+        title = st.text_input("照片标题", value=f"进度更新 {now_beijing().strftime('%m-%d')}")
         description = st.text_area("描述", placeholder="描述当前进度...")
         uploaded = st.file_uploader("选择照片", type=["jpg", "jpeg", "png"])
 
@@ -312,8 +313,8 @@ def _task_create(project: Project):
         with col2:
             due_date = st.date_input(
                 "截止日期",
-                value=datetime.now() + timedelta(days=7),
-                min_value=datetime.now(),
+                value=now_beijing().date() + timedelta(days=7),
+                min_value=now_beijing().date(),
             )
 
         st.divider()
@@ -440,12 +441,12 @@ def _generate_progress_report(base: TaskSnapshot, current: TaskSnapshot, project
     with col1:
         st.markdown(f"**基准: {base.title}**")
         st.image(str(base_path), width="stretch")
-        st.caption(f"{base.created_at.strftime('%Y-%m-%d %H:%M')}")
+        st.caption(f"{format_beijing(base.created_at)}")
 
     with col2:
         st.markdown(f"**当前: {current.title}**")
         st.image(str(current_path), width="stretch")
-        st.caption(f"{current.created_at.strftime('%Y-%m-%d %H:%M')}")
+        st.caption(f"{format_beijing(current.created_at)}")
 
     # 简单的时间进度分析
     time_diff = current.created_at - base.created_at
@@ -474,11 +475,11 @@ def _generate_progress_report(base: TaskSnapshot, current: TaskSnapshot, project
     **任务:** {base.task.name}
 
     **基准照片:** {base.title} ({_format_snapshot_type(base.snapshot_type)})
-    - 拍摄时间: {base.created_at.strftime('%Y年%m月%d日 %H:%M')}
+    - 拍摄时间: {format_beijing(base.created_at, '%Y年%m月%d日 %H:%M')}
     - 描述: {base.description or '无'}
 
     **当前照片:** {current.title} ({_format_snapshot_type(current.snapshot_type)})
-    - 拍摄时间: {current.created_at.strftime('%Y年%m月%d日 %H:%M')}
+    - 拍摄时间: {format_beijing(current.created_at, '%Y年%m月%d日 %H:%M')}
     - 描述: {current.description or '无'}
 
     **时间进度:**
@@ -557,7 +558,7 @@ def _update_task_status(task_id: int, status: str):
         if task:
             task.status = status
             if status == "completed":
-                task.completed_at = datetime.utcnow()
+                task.completed_at = now_utc()
             s.add(task)
 
 
@@ -583,7 +584,7 @@ def _save_snapshot(
     snapshots_dir = proj_dir / "task_snapshots" / f"task_{task_id}"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = beijing_timestamp()
     ext = Path(uploaded_file.name).suffix.lower()
     filename = f"{snapshot_type}_{timestamp}{ext}"
     file_path = snapshots_dir / filename
@@ -686,7 +687,6 @@ def _run_task_3d_modeling(task: Task, project: Project):
     """使用第一张照片进行3D建模."""
     import subprocess
     import sys
-    import time
     import uuid
 
     # 获取第一张照片
@@ -706,7 +706,7 @@ def _run_task_3d_modeling(task: Task, project: Project):
     model_dir.mkdir(parents=True, exist_ok=True)
 
     # 创建任务ID和状态文件
-    job_id = f"job_3d_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}_task{task.id}"
+    job_id = f"job_3d_{beijing_timestamp()}_{uuid.uuid4().hex[:4]}_task{task.id}"
     from src.storage import jobs_dir
     jdir = jobs_dir(project.id)
     jdir.mkdir(parents=True, exist_ok=True)
@@ -718,7 +718,7 @@ def _run_task_3d_modeling(task: Task, project: Project):
         "project_id": project.id,
         "overall_status": "running",
         "provider": "aholo3d",
-        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "started_at": beijing_timestamp("%Y-%m-%d %H:%M:%S"),
         "stages": [
             {"name": "upload", "status": "pending"},
             {"name": "create_task", "status": "pending"},
@@ -751,7 +751,7 @@ def _run_task_3d_modeling(task: Task, project: Project):
     model_3d_info = {
         "job_id": job_id,
         "status": "running",
-        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "started_at": beijing_timestamp("%Y-%m-%d %H:%M:%S"),
         "image": str(first_snapshot.file_path),
         "output_dir": str(model_dir.relative_to(project_dir(project.id))),
     }

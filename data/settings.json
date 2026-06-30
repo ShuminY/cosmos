@@ -2,5 +2,5 @@
   "registration_open": true,
   "min_password_length": 8,
   "llm_default_provider": "ark",
-  "llm_provider_ark": "{\"name\": \"\\u706b\\u5c71\\u65b9\\u821f (Volces Ark)\", \"model\": \"doubao-seed-2-0-pro-260215\", \"api_key\": \"20a3b00d-a213-46b7-a34d-4363c0189c76\", \"base_url\": \"https://ark.cn-beijing.volces.com/api/v3\"}"
+  "llm_provider_ark": "{\"name\": \"\\u706b\\u5c71\\u65b9\\u821f (Volces Ark)\", \"model\": \"doubao-seed-2-1-pro-260628\", \"api_key\": \"20a3b00d-a213-46b7-a34d-4363c0189c76\", \"base_url\": \"https://ark.cn-beijing.volces.com/api/v3\"}"
 }

@@ -17,6 +17,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
+from src.time_utils import beijing_timestamp
+
+
 def update_status(status_path: Path, **kwargs):
     """更新状态文件."""
     if status_path.exists():
@@ -24,7 +27,7 @@ def update_status(status_path: Path, **kwargs):
     else:
         cur = {}
     cur.update(kwargs)
-    cur["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    cur["updated_at"] = beijing_timestamp("%Y-%m-%d %H:%M:%S")
     status_path.write_text(json.dumps(cur, indent=2))
 
 
@@ -86,7 +89,7 @@ def main():
             if rc != 0:
                 mark(status_path, "extract_frames", "failed", f"exit={rc}")
                 update_status(status_path, overall_status="failed",
-                             finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                             finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S"))
                 return 1
 
             n_frames = len(list(args.frames_dir.glob("frame_*.jpg")))
@@ -102,7 +105,7 @@ def main():
         if rc != 0:
             mark(status_path, "reconstruct", "failed", f"exit={rc}")
             update_status(status_path, overall_status="failed",
-                         finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                         finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S"))
             return 1
 
         # 检查点云文件是否生成
@@ -112,16 +115,16 @@ def main():
         else:
             mark(status_path, "reconstruct", "failed", "point cloud file not found")
             update_status(status_path, overall_status="failed",
-                         finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                         finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S"))
             return 1
 
         update_status(status_path, overall_status="done",
-                     finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                     finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S"))
         return 0
 
     except Exception as e:
         update_status(status_path, overall_status="failed", error=str(e),
-                     finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                     finished_at=beijing_timestamp("%Y-%m-%d %H:%M:%S"))
         return 1
 
 

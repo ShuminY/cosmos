@@ -9,7 +9,6 @@ Provider registry pattern supports:
 from __future__ import annotations
 import json
 import mimetypes
-from datetime import datetime
 from typing import Callable, Any
 
 from sqlalchemy import select, desc
@@ -17,6 +16,7 @@ from sqlalchemy import select, desc
 from .db import session, ChatSession, ChatMessage, User, Project
 from .kb import search_kb
 from .settings import get_setting, set_setting
+from .time_utils import now_utc
 
 
 # ============ LLM Provider Registry ============
@@ -315,7 +315,7 @@ def vision_chat(query: str, image_paths: list[str],
         else:
             chat_sess = s.get(ChatSession, session_id)
             if chat_sess:
-                chat_sess.updated_at = datetime.utcnow()
+                chat_sess.updated_at = now_utc()
 
         user_msg = ChatMessage(
             session_id=session_id,
@@ -460,7 +460,7 @@ def chat(project_id: int, query: str, session_id: int | None = None,
             session_id = chat_sess.id
         else:
             chat_sess = s.get(ChatSession, session_id)
-            chat_sess.updated_at = datetime.utcnow()
+            chat_sess.updated_at = now_utc()
 
         # User message
         user_msg = ChatMessage(
