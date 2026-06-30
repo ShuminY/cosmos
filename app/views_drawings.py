@@ -592,9 +592,20 @@ def _render_review_items_table(items: list[dict]):
 def _load_annotation_font(size: int, bold: bool = False):
     """加载支持中文的标注字体，失败时回退到Pillow默认字体."""
     font_candidates = [
+        # macOS
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
         "/Library/Fonts/Arial Unicode.ttf",
+        # Debian/Ubuntu with fonts-noto-cjk / fonts-wqy-zenhei
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/arphic/ukai.ttc",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
+        # Common Windows fonts if mounted/copied
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simsun.ttc",
     ]
     for font_path in font_candidates:
         if Path(font_path).exists():
