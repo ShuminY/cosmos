@@ -939,6 +939,7 @@ def _proj_settings(p: Project):
     if st.button("Add"):
         if add_email and add_email != "(no users)":
             uid = opts[add_email]
+            added = False
             with session() as s:
                 exist = s.execute(select(ProjectMember).where(
                     ProjectMember.project_id == p.id,
@@ -946,7 +947,14 @@ def _proj_settings(p: Project):
                 )).scalar_one_or_none()
                 if exist is None:
                     s.add(ProjectMember(project_id=p.id, user_id=uid, role=add_role))
-                    st.success("Member added.")
-                    st.rerun()
-                else:
-                    st.warning("Already a member.")
+                    added = True
+            # NB: st.rerun() raises a BaseException, so it must run *outside*
+            # the session() block — otherwise the commit is skipped and the
+            # new member is silently dropped.
+            if added:
+                st.success("Member added.")
+                st.rerun()
+            else:
+                st.warning("Already a member.")
+        else:
+            st.warning("No user selected. Create another user account first (Admin → Users).")
