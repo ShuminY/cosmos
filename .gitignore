@@ -14,6 +14,7 @@ data/visit_*/*.MOV
 
 # local sqlite db (contains user auth records)
 data/index.db
+data/settings.json
 
 # absolute-path symlinks into local visit_*/outputs dirs
 data/projects/*/captures/*/frames
