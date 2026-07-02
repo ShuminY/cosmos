@@ -19,6 +19,7 @@ data/settings.json
 # absolute-path symlinks into local visit_*/outputs dirs
 data/projects/*/captures/*/frames
 data/projects/*/captures/*/outputs
+data/projects/*/pdf_conversions/*
 
 # python build artifacts
 *.egg-info/

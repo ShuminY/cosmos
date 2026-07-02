@@ -920,15 +920,46 @@ def _proj_settings(p: Project):
         st.rerun()
     st.divider()
     st.subheader("Members")
+    ROLE_CHOICES = ["viewer", "editor"]
     with session() as s:
         ms = s.execute(select(ProjectMember).where(ProjectMember.project_id == p.id)).scalars().all()
         member_rows = []
         for m in ms:
             uu = s.get(User, m.user_id)
-            member_rows.append({"user": uu.email, "role": m.role,
+            member_rows.append({"user_id": m.user_id, "email": uu.email, "role": m.role,
                                 "added": format_beijing(m.added_at, "%Y-%m-%d") if m.added_at else ""})
     if member_rows:
-        st.dataframe(member_rows, width="stretch", hide_index=True)
+        with st.container(border=True):
+            # Header row
+            h1, h2, h3, h4 = st.columns([3, 2, 1, 1])
+            h1.caption("User"); h2.caption("Role"); h3.caption("Added"); h4.caption("")
+            for row in member_rows:
+                st.divider()
+                c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
+                c1.markdown(f"**{row['email']}**")
+                cur_role = row["role"] if row["role"] in ROLE_CHOICES else ROLE_CHOICES[0]
+                new_role = c2.selectbox(
+                    "role", ROLE_CHOICES, index=ROLE_CHOICES.index(cur_role),
+                    key=f"mrole_{row['user_id']}", label_visibility="collapsed",
+                )
+                c3.caption(row["added"])
+                if new_role != row["role"]:
+                    if c4.button("Save", key=f"msave_{row['user_id']}", type="primary"):
+                        with session() as s:
+                            m = s.get(ProjectMember, (p.id, row["user_id"]))
+                            if m:
+                                m.role = new_role
+                                s.add(m)
+                        st.success(f"Updated {row['email']} → {new_role}.")
+                        st.rerun()
+                else:
+                    if c4.button("Remove", key=f"mdel_{row['user_id']}"):
+                        with session() as s:
+                            m = s.get(ProjectMember, (p.id, row["user_id"]))
+                            if m:
+                                s.delete(m)
+                        st.success(f"Removed {row['email']}.")
+                        st.rerun()
     else:
         st.caption("No members yet.")
     with session() as s:
