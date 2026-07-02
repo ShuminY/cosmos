@@ -5,6 +5,7 @@ import html
 import json
 import re
 import subprocess
+import uuid
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from zipfile import ZipFile
@@ -677,23 +678,28 @@ def _text_size(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[int, int]:
 
 
 def _wrap_text_for_draw(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
-    """按绘制宽度为中英文混排文本换行."""
-    text = str(text or "").strip()
-    if not text:
+    """按绘制宽度为中英文混排文本换行，并保留显式换行符."""
+    text = str(text or "")
+    if not text.strip():
         return [""]
 
     lines = []
-    current = ""
-    for char in text:
-        trial = current + char
-        width, _ = _text_size(draw, trial, font)
-        if current and width > max_width:
+    for segment in text.split("\n"):
+        segment = segment.strip()
+        if not segment:
+            lines.append("")
+            continue
+        current = ""
+        for char in segment:
+            trial = current + char
+            width, _ = _text_size(draw, trial, font)
+            if current and width > max_width:
+                lines.append(current)
+                current = char
+            else:
+                current = trial
+        if current:
             lines.append(current)
-            current = char
-        else:
-            current = trial
-    if current:
-        lines.append(current)
     return lines
 
 
@@ -779,7 +785,131 @@ def _review_page_match_summary(review_items: list[dict], total_pages: int) -> di
     return summary
 
 
-def _build_review_legend_image(image_path: Path, review_items: list[dict], output_path: Path, page_number: int | None = None) -> Path:
+def _load_manual_comments(analysis_data: dict) -> dict:
+    """从分析数据取出人工批注（按页码组织）."""
+    comments = analysis_data.get("manual_comments")
+    return comments if isinstance(comments, dict) else {}
+
+
+def _get_page_manual_comments(analysis_data: dict, page_number: int) -> list[dict]:
+    """取当前页人工批注."""
+    comments = _load_manual_comments(analysis_data)
+    page_comments = comments.get(f"page_{page_number}")
+    return page_comments if isinstance(page_comments, list) else []
+
+
+def _current_user_label() -> str:
+    """获取当前用户展示名称."""
+    user = st.session_state.get("user") or {}
+    return user.get("name") or user.get("email") or "匿名用户"
+
+
+def _save_manual_comments(doc_id: int, comments: dict):
+    """仅更新 analysis_data_json 中的 manual_comments，保留其他分析字段."""
+    with session() as s:
+        doc_db = s.query(Document).filter(Document.id == doc_id).first()
+        if not doc_db:
+            return
+        data = {}
+        if doc_db.analysis_data_json:
+            try:
+                data = json.loads(doc_db.analysis_data_json)
+            except json.JSONDecodeError:
+                data = {}
+        data["manual_comments"] = comments
+        doc_db.analysis_data_json = json.dumps(data, ensure_ascii=False, indent=2)
+        s.commit()
+
+
+def _add_manual_comment(doc_id: int, page_number: int, text: str):
+    """新增一条当前页人工批注."""
+    text = (text or "").strip()
+    if not text:
+        return
+    with session() as s:
+        doc_db = s.query(Document).filter(Document.id == doc_id).first()
+        if not doc_db:
+            return
+        data = {}
+        if doc_db.analysis_data_json:
+            try:
+                data = json.loads(doc_db.analysis_data_json)
+            except json.JSONDecodeError:
+                data = {}
+        comments = data.get("manual_comments")
+        if not isinstance(comments, dict):
+            comments = {}
+        page_key = f"page_{page_number}"
+        page_comments = comments.get(page_key)
+        if not isinstance(page_comments, list):
+            page_comments = []
+        stamp = now_utc().isoformat()
+        page_comments.append({
+            "id": f"c_{uuid.uuid4().hex[:8]}",
+            "text": text,
+            "author": _current_user_label(),
+            "created_at": stamp,
+            "updated_at": stamp,
+        })
+        comments[page_key] = page_comments
+        data["manual_comments"] = comments
+        doc_db.analysis_data_json = json.dumps(data, ensure_ascii=False, indent=2)
+        s.commit()
+
+
+def _update_manual_comment(doc_id: int, page_number: int, comment_id: str, text: str):
+    """编辑一条当前页人工批注."""
+    text = (text or "").strip()
+    if not text:
+        return
+    with session() as s:
+        doc_db = s.query(Document).filter(Document.id == doc_id).first()
+        if not doc_db or not doc_db.analysis_data_json:
+            return
+        try:
+            data = json.loads(doc_db.analysis_data_json)
+        except json.JSONDecodeError:
+            return
+        comments = data.get("manual_comments")
+        if not isinstance(comments, dict):
+            return
+        page_comments = comments.get(f"page_{page_number}")
+        if not isinstance(page_comments, list):
+            return
+        for comment in page_comments:
+            if comment.get("id") == comment_id:
+                comment["text"] = text
+                comment["updated_at"] = now_utc().isoformat()
+                break
+        data["manual_comments"] = comments
+        doc_db.analysis_data_json = json.dumps(data, ensure_ascii=False, indent=2)
+        s.commit()
+
+
+def _delete_manual_comment(doc_id: int, page_number: int, comment_id: str):
+    """删除一条当前页人工批注."""
+    with session() as s:
+        doc_db = s.query(Document).filter(Document.id == doc_id).first()
+        if not doc_db or not doc_db.analysis_data_json:
+            return
+        try:
+            data = json.loads(doc_db.analysis_data_json)
+        except json.JSONDecodeError:
+            return
+        comments = data.get("manual_comments")
+        if not isinstance(comments, dict):
+            return
+        page_key = f"page_{page_number}"
+        page_comments = comments.get(page_key)
+        if not isinstance(page_comments, list):
+            return
+        comments[page_key] = [c for c in page_comments if c.get("id") != comment_id]
+        data["manual_comments"] = comments
+        doc_db.analysis_data_json = json.dumps(data, ensure_ascii=False, indent=2)
+        s.commit()
+
+
+def _build_review_legend_image(image_path: Path, review_items: list[dict], output_path: Path, page_number: int | None = None, manual_comments: list[dict] | None = None) -> Path:
     """在图纸右侧扩展当前页审核问题编号图例，并保存为PNG."""
     with Image.open(image_path) as source:
         base_img = source.convert("RGB")
@@ -809,6 +939,10 @@ def _build_review_legend_image(image_path: Path, review_items: list[dict], outpu
             draw.text((width + padding, y), line, fill=(107, 114, 128), font=body_font)
             _, line_h = _text_size(draw, line, body_font)
             y += line_h + 8
+        _draw_manual_comments_section(
+            draw, manual_comments, width, sidebar_width, height, padding, y,
+            title_font, body_font, small_font,
+        )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         annotated.save(output_path, format="PNG")
         return output_path
@@ -862,9 +996,172 @@ def _build_review_legend_image(image_path: Path, review_items: list[dict], outpu
         y += item_height
         visible_count += 1
 
+    _draw_manual_comments_section(
+        draw, manual_comments, width, sidebar_width, height, padding, y,
+        title_font, body_font, small_font,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     annotated.save(output_path, format="PNG")
     return output_path
+
+
+def _draw_manual_comments_section(draw, manual_comments, width, sidebar_width, height, padding, y, title_font, body_font, small_font):
+    """在右侧图例栏底部绘制人工批注分区."""
+    comments = manual_comments or []
+    if not comments:
+        return
+
+    _, body_h = _text_size(draw, "国", body_font)
+    _, small_h = _text_size(draw, "国", small_font)
+    max_text_width = sidebar_width - padding * 2
+
+    # 与上方内容留出间隔，并画分隔线
+    y += 14
+    if y > height - padding:
+        return
+    draw.rectangle([width + padding, y, width + sidebar_width - padding, y + 1], fill=(209, 213, 219))
+    y += 14
+
+    heading = "人工批注"
+    draw.text((width + padding, y), heading, fill=(17, 24, 39), font=title_font)
+    _, heading_h = _text_size(draw, heading, title_font)
+    y += heading_h + 12
+
+    for idx, comment in enumerate(comments, start=1):
+        author = comment.get("author", "") or "匿名用户"
+        text = comment.get("text", "") or ""
+        created_at = comment.get("created_at", "")
+        time_str = ""
+        if created_at:
+            try:
+                time_str = format_beijing(datetime.fromisoformat(created_at), "%Y-%m-%d %H:%M")
+            except Exception:
+                time_str = ""
+
+        header = f"{idx}. {author}" + (f" · {time_str}" if time_str else "")
+        header_lines = _wrap_text_for_draw(draw, header, small_font, max_text_width)
+        text_lines = _wrap_text_for_draw(draw, text, body_font, max_text_width)
+        block_height = len(header_lines) * (small_h + 3) + len(text_lines) * (body_h + 4) + 12
+
+        if y + block_height > height - padding:
+            remaining = len(comments) - idx + 1
+            note = f"其余 {remaining} 条人工批注请在页面下方查看。"
+            note_y = max(y, height - padding - (small_h + 4))
+            for line in _wrap_text_for_draw(draw, note, small_font, max_text_width):
+                draw.text((width + padding, note_y), line, fill=(107, 114, 128), font=small_font)
+                note_y += small_h + 4
+            break
+
+        for line in header_lines:
+            draw.text((width + padding, y), line, fill=(37, 99, 235), font=small_font)
+            y += small_h + 3
+        for line in text_lines:
+            draw.text((width + padding, y), line, fill=(31, 41, 55), font=body_font)
+            y += body_h + 4
+        y += 10
+
+
+def _build_comment_stitched_image(image_path: Path, page_number: int, comments: list[dict]) -> Image.Image:
+    """将单页图纸与该页人工批注拼接为一张图（右侧批注栏，画布高度自适应）."""
+    with Image.open(image_path) as source:
+        base_img = source.convert("RGB")
+
+    width, height = base_img.size
+    sidebar_width = max(420, min(760, max(width // 2, 1)))
+    padding = 24
+    title_font = _load_annotation_font(max(24, min(40, width // 45)))
+    body_font = _load_annotation_font(max(18, min(28, width // 70)))
+    small_font = _load_annotation_font(max(15, min(22, width // 90)))
+
+    # 用实际字高计算行距（与 _build_review_legend_image 一致），避免文字重叠
+    measure = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    _, body_ch = _text_size(measure, "国", body_font)
+    _, small_ch = _text_size(measure, "国", small_font)
+    _, title_ch = _text_size(measure, "国", title_font)
+    body_h = body_ch + 8
+    small_h = small_ch + 6
+    title_h = title_ch + 10
+    comment_gap = 16
+    max_text_width = sidebar_width - padding * 2
+
+    needed = padding + title_h + 18
+    for idx, comment in enumerate(comments, start=1):
+        author = comment.get("author", "") or "匿名用户"
+        text = comment.get("text", "") or ""
+        created_at = comment.get("created_at", "")
+        time_str = ""
+        if created_at:
+            try:
+                time_str = format_beijing(datetime.fromisoformat(created_at), "%Y-%m-%d %H:%M")
+            except Exception:
+                time_str = ""
+        header = f"{idx}. {author}" + (f" · {time_str}" if time_str else "")
+        header_lines = _wrap_text_for_draw(measure, header, small_font, max_text_width)
+        text_lines = _wrap_text_for_draw(measure, text, body_font, max_text_width)
+        needed += len(header_lines) * small_h + len(text_lines) * body_h + comment_gap
+    needed += padding
+
+    canvas_height = max(height, needed)
+    annotated = Image.new("RGB", (width + sidebar_width, canvas_height), "white")
+    annotated.paste(base_img, (0, 0))
+    draw = ImageDraw.Draw(annotated)
+    draw.rectangle([width, 0, width + 2, canvas_height], fill=(229, 231, 235))
+
+    y = padding
+    title = f"第 {page_number} 页人工批注"
+    draw.text((width + padding, y), title, fill=(17, 24, 39), font=title_font)
+    y += title_h + 18
+
+    if not comments:
+        for line in _wrap_text_for_draw(draw, "本页暂无人工批注。", body_font, max_text_width):
+            draw.text((width + padding, y), line, fill=(107, 114, 128), font=body_font)
+            y += body_h
+        return annotated
+
+    for idx, comment in enumerate(comments, start=1):
+        author = comment.get("author", "") or "匿名用户"
+        text = comment.get("text", "") or ""
+        created_at = comment.get("created_at", "")
+        time_str = ""
+        if created_at:
+            try:
+                time_str = format_beijing(datetime.fromisoformat(created_at), "%Y-%m-%d %H:%M")
+            except Exception:
+                time_str = ""
+        header = f"{idx}. {author}" + (f" · {time_str}" if time_str else "")
+        for line in _wrap_text_for_draw(draw, header, small_font, max_text_width):
+            draw.text((width + padding, y), line, fill=(37, 99, 235), font=small_font)
+            y += small_h
+        for line in _wrap_text_for_draw(draw, text, body_font, max_text_width):
+            draw.text((width + padding, y), line, fill=(31, 41, 55), font=body_font)
+            y += body_h
+        y += comment_gap
+
+    return annotated
+
+
+def _export_comment_annotated_pdf(doc: Document, analysis_data: dict) -> bytes | None:
+    """将每页图纸与人工批注拼接后合成一个多页PDF；无可用图片时返回None."""
+    image_paths = [Path(p) for p in analysis_data.get("preprocessed_images", []) if Path(p).exists()]
+    if not image_paths:
+        return None
+
+    pages = []
+    for idx, image_path in enumerate(image_paths):
+        page_number = idx + 1
+        comments = _get_page_manual_comments(analysis_data, page_number)
+        try:
+            pages.append(_build_comment_stitched_image(image_path, page_number, comments))
+        except Exception:
+            continue
+
+    if not pages:
+        return None
+
+    from io import BytesIO
+    buffer = BytesIO()
+    pages[0].save(buffer, format="PDF", save_all=True, append_images=pages[1:])
+    return buffer.getvalue()
 
 
 def _render_review_legend_images(doc: Document, review_items: list[dict], analysis_data: dict):
@@ -903,35 +1200,166 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
                 _render_review_items_table(unknown_page_items)
 
     current_image = image_paths[selected_index]
-    output_path = _annotated_image_output_path(doc.project_id, doc.id, current_image, selected_index)
+    page_comments = _get_page_manual_comments(analysis_data, page_number)
 
-    try:
-        annotated_path = _build_review_legend_image(
+    col_image, col_review, col_comments = st.columns([6, 2, 2])
+
+    with col_image:
+        # 暂不拼接审核问题侧栏，直接展示原始页图，并支持缩放。
+        _render_full_resolution_image(
             current_image,
-            current_page_items,
-            output_path,
-            page_number=page_number,
+            f"第 {page_number} 页图纸",
+            key=f"review_legend_image_{doc.id}_{selected_index}",
         )
-    except Exception as e:
-        st.error(f"生成审核标注图失败: {e}")
+        st.download_button(
+            label="🖼️ 下载当前页图纸 PNG",
+            data=current_image.read_bytes(),
+            file_name=f"{Path(doc.filename).stem}_第{page_number:03d}页.png",
+            mime="image/png",
+            key=f"download_review_legend_{doc.id}_{selected_index}",
+        )
+
+    with col_review:
+        _render_page_review_items(doc, page_number, current_page_items)
+
+    with col_comments:
+        _render_manual_comments_ui(doc, page_number, page_comments)
+
+
+def _review_item_confirm_text(item: dict) -> str:
+    """将确认为“对”的系统审核问题整理成人工批注文本."""
+    rule_id = item.get("规则编号", "") or "未编号"
+    severity = item.get("严重程度", "") or "待复核"
+    location = item.get("部位", "") or "部位未明确"
+    description = item.get("问题描述", "") or "问题描述为空"
+    suggestion = item.get("建议", "")
+    lines = [f"[{rule_id}] {severity}", f"部位：{location}", f"问题：{description}"]
+    if suggestion:
+        lines.append(f"建议：{suggestion}")
+    return "\n".join(lines)
+
+
+def _render_page_review_items(doc: Document, page_number: int, page_items: list[dict]):
+    """按 1、2、3 分条展示当前页系统审核问题，支持人工对错确认."""
+    st.markdown(f"#### 🔍 第 {page_number} 页系统审核")
+    if not page_items:
+        st.caption("本页暂无匹配到页码的系统审核问题。")
         return
 
-    _render_full_resolution_image(
-        annotated_path,
-        f"第 {page_number} 页审核问题图例标注图",
-        key=f"review_legend_image_{doc.id}_{selected_index}",
-    )
-    st.download_button(
-        label="🖼️ 下载当前页标注图 PNG",
-        data=annotated_path.read_bytes(),
-        file_name=f"{Path(doc.filename).stem}_审核标注_page{page_number:03d}.png",
-        mime="image/png",
-        key=f"download_review_legend_{doc.id}_{selected_index}",
-    )
+    for idx, item in enumerate(page_items, start=1):
+        severity = item.get("严重程度", "") or "待复核"
+        rule_id = item.get("规则编号", "") or "未编号"
+        location = item.get("部位", "") or "部位未明确"
+        description = item.get("问题描述", "") or "问题描述为空"
+        suggestion = item.get("建议", "")
+        verdict_key = f"review_verdict_{doc.id}_{page_number}_{idx}"
+        verdict = st.session_state.get(verdict_key)
+
+        def _render_detail():
+            st.markdown(f"**{idx}. [{rule_id}] {severity}**")
+            st.markdown(f"部位：{location}")
+            st.markdown(f"问题：{description}")
+            if suggestion:
+                st.markdown(f"建议：{suggestion}")
+
+        with st.container(border=True):
+            summary = f"{idx}. [{rule_id}] {severity} 部位：{location} 问题：{description}"
+            if len(summary) <= 50:
+                _render_detail()
+            else:
+                st.markdown(summary[:50] + "…")
+                with st.expander("展开", expanded=False):
+                    _render_detail()
+
+            if verdict == "correct":
+                st.success("已确认成立，已加入人工批注")
+            elif verdict == "wrong":
+                st.info("已标记为不成立")
+
+            c1, c2 = st.columns(2)
+            if c1.button("✅ 对", key=f"correct_{doc.id}_{page_number}_{idx}"):
+                if verdict != "correct":
+                    _add_manual_comment(doc.id, page_number, _review_item_confirm_text(item))
+                st.session_state[verdict_key] = "correct"
+                st.rerun()
+            if c2.button("❌ 错", key=f"wrong_{doc.id}_{page_number}_{idx}"):
+                st.session_state[verdict_key] = "wrong"
+                st.rerun()
+
+
+def _estimate_text_area_height(text: str) -> int:
+    """根据文本行数估算 text_area 高度，避免编辑时只显示部分文字."""
+    text = text or ""
+    explicit_lines = text.count("\n") + 1
+    # 估算长行自动换行占用的额外行数（按每行约 18 个全角字符）。
+    wrapped_lines = sum(max(1, (len(seg) // 18) + 1) for seg in text.split("\n"))
+    lines = max(explicit_lines, wrapped_lines)
+    return max(80, min(400, lines * 26 + 20))
+
+
+def _render_manual_comments_ui(doc: Document, page_number: int, page_comments: list[dict]):
+    """当前页人工批注的增删改界面（显示在图片右侧）."""
+    st.markdown(f"#### 📝 第 {page_number} 页人工批注")
+    st.caption("批注保存到本审核结果中，按页码记录。")
+
+    if page_comments:
+        for idx, comment in enumerate(page_comments, start=1):
+            comment_id = comment.get("id", "")
+            author = comment.get("author", "") or "匿名用户"
+            created_at = comment.get("created_at", "")
+            time_str = ""
+            if created_at:
+                try:
+                    time_str = format_beijing(datetime.fromisoformat(created_at), "%Y-%m-%d %H:%M")
+                except Exception:
+                    time_str = ""
+            edit_key = f"edit_comment_{doc.id}_{page_number}_{comment_id}"
+            with st.container(border=True):
+                st.markdown(f"**{idx}. {author}**" + (f" · {time_str}" if time_str else ""))
+                if st.session_state.get(edit_key, False):
+                    new_text = st.text_area(
+                        "编辑批注",
+                        value=comment.get("text", ""),
+                        key=f"edit_text_{doc.id}_{page_number}_{comment_id}",
+                        height=_estimate_text_area_height(comment.get("text", "")),
+                    )
+                    c1, c2 = st.columns(2)
+                    if c1.button("保存", key=f"save_{doc.id}_{page_number}_{comment_id}", type="primary"):
+                        _update_manual_comment(doc.id, page_number, comment_id, new_text)
+                        st.session_state[edit_key] = False
+                        st.rerun()
+                    if c2.button("取消", key=f"cancel_{doc.id}_{page_number}_{comment_id}"):
+                        st.session_state[edit_key] = False
+                        st.rerun()
+                else:
+                    st.markdown(comment.get("text", ""))
+                    c1, c2 = st.columns(2)
+                    if c1.button("✏️ 编辑", key=f"editbtn_{doc.id}_{page_number}_{comment_id}"):
+                        st.session_state[edit_key] = True
+                        st.rerun()
+                    if c2.button("🗑️ 删除", key=f"del_{doc.id}_{page_number}_{comment_id}"):
+                        _delete_manual_comment(doc.id, page_number, comment_id)
+                        st.rerun()
+    else:
+        st.caption("本页暂无人工批注。")
+
+    with st.form(key=f"add_comment_{doc.id}_{page_number}", clear_on_submit=True):
+        new_comment = st.text_area(
+            "新增人工批注",
+            placeholder="输入需要标注在右侧的人工批注...",
+            height=80,
+            key=f"new_comment_{doc.id}_{page_number}",
+        )
+        if st.form_submit_button("➕ 添加批注", type="primary"):
+            if new_comment.strip():
+                _add_manual_comment(doc.id, page_number, new_comment)
+                st.rerun()
+            else:
+                st.warning("请输入批注内容。")
 
 
 def _render_full_resolution_image(image_path: Path, caption: str, key: str):
-    """先显示缩略图，并提供新标签页查看原图入口."""
+    """在图片上方提供查看原图入口，并内嵌可缩放/拖动的图片查看器."""
     try:
         with Image.open(image_path) as img:
             width, height = img.size
@@ -939,38 +1367,87 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str):
         st.image(str(image_path), caption=caption, width="stretch")
         return
 
-    st.image(str(image_path), caption=f"{caption}（缩略图）", width="stretch")
     data = base64.b64encode(image_path.read_bytes()).decode("ascii")
     safe_key = re.sub(r"[^a-zA-Z0-9_-]", "_", key)
+    st.caption(f"{caption} · 原始 {width} × {height}px · 使用按钮或滚轮缩放，可拖动查看。")
     components.html(
         f"""
-<button id="open-{safe_key}" style="
-    padding:0.45rem 0.75rem;
-    border:1px solid #d1d5db;
-    border-radius:0.5rem;
-    color:#111827;
-    background:#ffffff;
-    font-size:0.95rem;
-    cursor:pointer;
-">🔎 查看原图（{width} × {height}px）</button>
+<div style="font-family:sans-serif;">
+  <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
+    <button id="open-{safe_key}" style="padding:0.35rem 0.6rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">🔎 查看原图</button>
+    <button id="zoomout-{safe_key}" style="padding:0.35rem 0.6rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">➖</button>
+    <button id="zoomin-{safe_key}" style="padding:0.35rem 0.6rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">➕</button>
+    <button id="reset-{safe_key}" style="padding:0.35rem 0.6rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">复位</button>
+    <span id="pct-{safe_key}" style="color:#6b7280; font-size:0.9rem;">100%</span>
+  </div>
+  <div id="frame-{safe_key}" style="border:1px solid #e5e7eb; border-radius:8px; background:#f9fafb; overflow:auto; max-height:640px; cursor:grab;">
+    <img id="img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px;" />
+  </div>
+</div>
 <script>
 (function() {{
-  const button = document.getElementById('open-{safe_key}');
   const base64 = '{data}';
-  button.addEventListener('click', function() {{
+  const img = document.getElementById('img-{safe_key}');
+  const frame = document.getElementById('frame-{safe_key}');
+  const pct = document.getElementById('pct-{safe_key}');
+  const baseW = {width}, baseH = {height};
+  let scale = 1;
+
+  function fit() {{
+    const avail = frame.clientWidth - 2;
+    if (avail > 0 && baseW > 0) {{
+      scale = Math.min(1, avail / baseW);
+    }}
+    apply();
+  }}
+  function apply() {{
+    img.style.width = (baseW * scale) + 'px';
+    img.style.height = (baseH * scale) + 'px';
+    pct.textContent = Math.round(scale * 100) + '%';
+  }}
+  function zoom(factor) {{
+    scale = Math.min(8, Math.max(0.05, scale * factor));
+    apply();
+  }}
+
+  document.getElementById('zoomin-{safe_key}').addEventListener('click', () => zoom(1.25));
+  document.getElementById('zoomout-{safe_key}').addEventListener('click', () => zoom(0.8));
+  document.getElementById('reset-{safe_key}').addEventListener('click', fit);
+
+  frame.addEventListener('wheel', function(e) {{
+    if (!e.ctrlKey && !e.metaKey) return;
+    e.preventDefault();
+    zoom(e.deltaY < 0 ? 1.1 : 0.9);
+  }}, {{ passive: false }});
+
+  // Drag to pan
+  let dragging = false, sx = 0, sy = 0, sl = 0, stp = 0;
+  frame.addEventListener('mousedown', function(e) {{
+    dragging = true; sx = e.clientX; sy = e.clientY; sl = frame.scrollLeft; stp = frame.scrollTop;
+    frame.style.cursor = 'grabbing';
+  }});
+  window.addEventListener('mouseup', function() {{ dragging = false; frame.style.cursor = 'grab'; }});
+  window.addEventListener('mousemove', function(e) {{
+    if (!dragging) return;
+    frame.scrollLeft = sl - (e.clientX - sx);
+    frame.scrollTop = stp - (e.clientY - sy);
+  }});
+
+  document.getElementById('open-{safe_key}').addEventListener('click', function() {{
     const binary = atob(base64);
     const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {{
-      bytes[i] = binary.charCodeAt(i);
-    }}
+    for (let i = 0; i < binary.length; i++) {{ bytes[i] = binary.charCodeAt(i); }}
     const blob = new Blob([bytes], {{ type: 'image/png' }});
     const url = URL.createObjectURL(blob);
     window.open(url, '_blank', 'noopener,noreferrer');
   }});
+
+  fit();
+  window.addEventListener('resize', fit);
 }})();
 </script>
 """,
-        height=46,
+        height=720,
     )
 
 
@@ -1028,6 +1505,66 @@ def _export_review_as_csv(review_items: list[dict]) -> str:
     return "﻿" + "\n".join(lines)
 
 
+def _export_manual_comments_xlsx(doc: Document, analysis_data: dict) -> bytes | None:
+    """将所有页的人工批注导出为 Excel 字节流；无批注时返回 None."""
+    comments_by_page = _load_manual_comments(analysis_data)
+    if not comments_by_page:
+        return None
+
+    # 按页码顺序整理
+    def _page_num(key: str) -> int:
+        try:
+            return int(str(key).replace("page_", ""))
+        except ValueError:
+            return 0
+
+    rows = []
+    for page_key in sorted(comments_by_page.keys(), key=_page_num):
+        page_comments = comments_by_page.get(page_key) or []
+        for idx, comment in enumerate(page_comments, start=1):
+            created_at = comment.get("created_at", "")
+            time_str = ""
+            if created_at:
+                try:
+                    time_str = format_beijing(datetime.fromisoformat(created_at), "%Y-%m-%d %H:%M")
+                except Exception:
+                    time_str = created_at
+            rows.append([
+                _page_num(page_key),
+                idx,
+                comment.get("author", "") or "匿名用户",
+                comment.get("text", "") or "",
+                time_str,
+            ])
+
+    if not rows:
+        return None
+
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "人工批注"
+    headers = ["页码", "序号", "批注人", "批注内容", "时间"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for row in rows:
+        ws.append(row)
+
+    widths = [8, 8, 16, 60, 20]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + i)].width = w
+    for row_cells in ws.iter_rows(min_row=2):
+        row_cells[3].alignment = Alignment(wrap_text=True, vertical="top")
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
 def _render_document_result(doc: Document):
     """按类型渲染文档分析/审核结果."""
     analysis_data = _parse_analysis_data(doc)
@@ -1038,16 +1575,17 @@ def _render_document_result(doc: Document):
         review_items = _extract_standard_review_items(doc.analysis_summary or "")
         if review_items:
             _render_review_items_table(review_items)
-            with st.expander("查看审核原文", expanded=False):
-                st.write(doc.analysis_summary)
 
-            with st.expander("🖼️ 查看审核标注图", expanded=False):
+            with st.expander("🖼️ 查看审核标注图", expanded=True):
                 st.caption("自动在图纸右侧生成审核问题编号图例；编号与下方标准提疑表顺序一致。")
                 _render_review_legend_images(doc, review_items, analysis_data)
 
+            with st.expander("查看审核原文", expanded=False):
+                st.write(doc.analysis_summary)
+
             # 导出功能区域
             st.divider()
-            col1, col2 = st.columns([1, 3])
+            col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
             with col1:
                 # 导出 Markdown
                 md_content = _export_review_as_markdown(doc, review_items)
@@ -1071,6 +1609,38 @@ def _render_document_result(doc: Document):
                     mime="text/csv",
                     key=f"export_csv_{doc.id}",
                 )
+            with col3:
+                # 导出人工批注 Excel
+                xlsx_bytes = _export_manual_comments_xlsx(doc, analysis_data)
+                st.download_button(
+                    label="📝 导出人工批注 Excel",
+                    data=xlsx_bytes or b"",
+                    file_name=f"{Path(doc.filename).stem}_人工批注_{timestamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"export_comments_xlsx_{doc.id}",
+                    disabled=xlsx_bytes is None,
+                    help=None if xlsx_bytes else "暂无人工批注可导出",
+                )
+            with col4:
+                # 导出人工批注结果（图纸+批注拼接后合成多页PDF）
+                if st.button(
+                    "📑 导出批注结果 PDF",
+                    key=f"gen_comments_pdf_{doc.id}",
+                    help="将每页图纸与人工批注拼接，合成一个多页PDF",
+                ):
+                    with st.spinner("正在生成批注结果 PDF..."):
+                        st.session_state[f"comments_pdf_{doc.id}"] = _export_comment_annotated_pdf(doc, analysis_data)
+                pdf_bytes = st.session_state.get(f"comments_pdf_{doc.id}")
+                if pdf_bytes:
+                    st.download_button(
+                        label="⬇️ 下载批注结果 PDF",
+                        data=pdf_bytes,
+                        file_name=f"{Path(doc.filename).stem}_批注结果_{timestamp}.pdf",
+                        mime="application/pdf",
+                        key=f"download_comments_pdf_{doc.id}",
+                    )
+                elif pdf_bytes is not None:
+                    st.caption("无可用于生成的预处理图片。")
         else:
             st.info("未能从审核结果中解析出标准提疑表格，以下展示审核原文。")
             st.write(doc.analysis_summary)
@@ -1274,17 +1844,15 @@ def view_drawing_analysis_history(project: Project):
 
     status_filter = st.selectbox(
         "按状态筛选",
-        ["全部", "已分析", "待分析", "分析失败"],
+        ["全部", "已分析", "分析失败"],
         key="drawing_history_status_filter",
     )
 
-    filtered_docs = docs
+    filtered_docs = history_docs
     if status_filter == "已分析":
-        filtered_docs = [d for d in docs if d.analysis_status == "done"]
-    elif status_filter == "待分析":
-        filtered_docs = [d for d in docs if d.analysis_status in ["pending", "running"]]
+        filtered_docs = [d for d in history_docs if d.analysis_status == "done"]
     elif status_filter == "分析失败":
-        filtered_docs = [d for d in docs if d.analysis_status == "failed"]
+        filtered_docs = [d for d in history_docs if d.analysis_status == "failed"]
 
     st.subheader(f"图纸列表 ({len(filtered_docs)})")
 
