@@ -183,6 +183,59 @@ class DocumentChunk(Base):
     document = relationship("Document")
 
 
+class ReviewRule(Base):
+    """审图规则库（RAG 检索用）。规则以数据库为唯一数据源，可从 Excel 导入。"""
+    __tablename__ = "review_rules"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    rule_code = Column(String(64), nullable=False, index=True)  # 规则编号，如 A-01
+    category_l1 = Column(String(255), nullable=True)   # 一级分类(审查大类)
+    category_l2 = Column(String(255), nullable=True)   # 二级分类
+    check_item = Column(String(512), nullable=True)    # 审查项(审什么)
+    content = Column(Text, nullable=True)              # 审查内容说明
+    method = Column(Text, nullable=True)               # 如何审核(方法/步骤)
+    criteria = Column(Text, nullable=True)             # 判定标准(命中即提疑)
+    disciplines = Column(String(512), nullable=True)   # 涉及专业
+    drawings = Column(String(512), nullable=True)      # 涉及图纸
+    example = Column(Text, nullable=True)              # 典型问题示例(真实)
+    ai_logic = Column(Text, nullable=True)             # AI判定逻辑
+    severity = Column(String(32), nullable=True)       # 严重程度
+    suggestion = Column(Text, nullable=True)           # 处理建议
+    embedding = Column(String, nullable=True)          # JSON-serialized numpy array
+    source = Column(String(255), nullable=True)        # 来源，如 xlsx 文件名
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc, nullable=False)
+
+    project = relationship("Project")
+
+    __table_args__ = (
+        Index("ix_review_rules_project_code", "project_id", "rule_code"),
+    )
+
+
+class ReviewCase(Base):
+    """人工审图案例知识库。由人工批注/确认自动向量化入库，参与后续审核检索。"""
+    __tablename__ = "review_cases"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    source_document_id = Column(Integer, ForeignKey("documents.id"), nullable=True, index=True)
+    page_num = Column(Integer, nullable=True)
+    rule_code = Column(String(64), nullable=True, index=True)
+    location = Column(String(512), nullable=True)      # 部位
+    problem = Column(Text, nullable=True)              # 问题描述
+    suggestion = Column(Text, nullable=True)           # 建议
+    severity = Column(String(32), nullable=True)       # 严重程度
+    verdict = Column(String(32), nullable=True)        # 'confirmed'(确认成立) | 'manual'(人工批注)
+    author = Column(String(255), nullable=True)
+    text = Column(Text, nullable=False)                # 用于展示/向量化的整合文本
+    embedding = Column(String, nullable=True)          # JSON-serialized numpy array
+    created_at = Column(DateTime, default=now_utc, nullable=False)
+
+    project = relationship("Project")
+    document = relationship("Document")
+
+
 class ChatSession(Base):
     """Persisted chat conversation for the KB chatbot."""
     __tablename__ = "chat_sessions"

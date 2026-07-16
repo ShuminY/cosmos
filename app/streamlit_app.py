@@ -44,6 +44,7 @@ from views import (
 from views_kb import view_knowledge_base, view_chatbot, view_chat_image, view_llm_settings
 from views_tasks import view_task_tracking
 from views_drawings import view_drawing_analysis
+from views_review_kb import view_review_knowledge_base
 from src.db import init_db
 from src.time_utils import beijing_timestamp
 init_db()
@@ -167,6 +168,7 @@ nav_groups = {
     "📂 Projects": ["Projects"],
     "📋 任务追踪": ["Tasks"],
     "📐 图纸分析": ["图纸分析"],
+    "📚 审图知识库": ["审图知识库"],
     "💡 智能问答": ["知识库", "智能问答", "图片问答"],
     "🧪 Demo data": ["Overview", "Upload", "Visits", "World model", "Point Cloud", "Segments",
                      "Matches (HITL)", "References", "Change report"],
@@ -883,6 +885,7 @@ PAGES = {
     "Projects": view_projects,
     "Tasks": lambda: view_task_tracking(get_current_project()),
     "图纸分析": lambda: view_drawing_analysis(get_current_project()),
+    "审图知识库": view_review_knowledge_base,
     "Profile": view_profile,
     "Users": view_admin_users,
     "LLM 设置": view_llm_settings,

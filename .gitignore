@@ -20,6 +20,7 @@ data/settings.json
 data/projects/*/captures/*/frames
 data/projects/*/captures/*/outputs
 data/projects/*/pdf_conversions/*
+data/projects/*/annotated_drawings/*
 
 # python build artifacts
 *.egg-info/

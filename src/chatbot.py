@@ -251,11 +251,19 @@ def provider_openai_vision(prompt: str, config: dict, image_paths: list[str] = N
 
     content = [{"type": "text", "text": prompt}]
     if image_paths:
-        for img_path in image_paths:
+        multi = len(image_paths) > 1
+        for idx, img_path in enumerate(image_paths, start=1):
             try:
                 mime_type = mimetypes.guess_type(img_path)[0] or "image/png"
                 with open(img_path, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode("utf-8")
+                if multi:
+                    # 在每张图前插入显式页码标签，避免模型靠数图片导致页码错位。
+                    # 页码 = 图片顺序（1-based），与后续按页码定位/标注的口径一致。
+                    content.append({
+                        "type": "text",
+                        "text": f"【第 {idx} 页 / 共 {len(image_paths)} 页（文件：{Path(img_path).name}）】",
+                    })
                 content.append({
                     "type": "image_url",
                     "image_url": {

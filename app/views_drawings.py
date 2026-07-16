@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 import uuid
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from zipfile import ZipFile
@@ -34,6 +35,8 @@ from src.chatbot import (
     list_chat_sessions, vision_chat,
 )
 from src.db import session, ChatSession, Document, Project
+from src.prompts import load_prompt
+from src import drawing_rag
 from src.storage import documents_dir, project_dir
 from src.time_utils import beijing_timestamp, format_beijing, now_utc
 
@@ -171,24 +174,15 @@ def _prepare_drawing_images(doc: Document, project_id: int) -> tuple[list[Path],
 
 
 def _format_drawing_prompt(doc: Document, analysis_type: list[str], custom_prompt: str) -> str:
-    """构建图纸分析提示词."""
+    """构建图纸分析提示词（模板来自 prompts/drawing_analysis.md）."""
     focus = "、".join(analysis_type) if analysis_type else "综合图纸分析"
     extra = f"\n\n用户补充要求：{custom_prompt}" if custom_prompt else ""
-    return f"""
-你是专业的建筑/施工图纸分析助手。请基于上传的图纸图片进行分析。
-
-图纸文件：{doc.filename}
-分析重点：{focus}
-
-请输出结构化 Markdown，至少包含：
-1. 图纸总体说明：判断图纸类型、主要空间/构件、可见图例或标题栏信息。
-2. 尺寸与标注：列出能识别的关键尺寸、轴网、标高或编号；无法确认的请标注“需人工复核”。
-3. 材料与工程量线索：提取材料、做法、设备/构件清单，以及可推断的数量/面积/长度线索。
-4. 施工与质量关注点：列出施工顺序、关键节点、风险点、需要现场确认的问题。
-5. 后续追问建议：给出 3-5 个用户可以继续问的问题。
-
-要求：不要编造看不清的信息；不确定时明确说明；输出使用中文。{extra}
-""".strip()
+    return load_prompt(
+        "drawing_analysis",
+        filename=doc.filename,
+        focus=focus,
+        extra=extra,
+    )
 
 
 def _column_index(cell_ref: str) -> int:
@@ -259,100 +253,53 @@ def _read_xlsx_sheet_rows(path: Path, sheet_name: str) -> list[list[str]]:
         return rows
 
 
-@st.cache_data(show_spinner=False)
-def _load_review_rules(project_id: int) -> tuple[list[dict], str | None]:
-    """读取项目审图规则库."""
-    rules_path = Path("data") / "projects" / str(project_id) / RULES_WORKBOOK_NAME
-    if not rules_path.exists():
-        return [], f"未找到审图规则库：{rules_path}"
-
-    try:
-        rows = _read_xlsx_sheet_rows(rules_path, "审图规则库")
-    except Exception as e:
-        return [], f"读取审图规则库失败：{e}"
-
-    header_idx = next((i for i, row in enumerate(rows) if "规则编号" in row), None)
-    if header_idx is None:
-        return [], "审图规则库中未找到表头“规则编号”"
-
-    headers = rows[header_idx]
-    rules = []
-    for row in rows[header_idx + 1:]:
-        if not any(row):
-            continue
-        item = {headers[i]: row[i] if i < len(row) else "" for i in range(len(headers)) if headers[i]}
-        if item.get("规则编号"):
-            rules.append(item)
-    return rules, None
-
-
-def _rules_to_markdown(rules: list[dict], max_rules: int = 120) -> str:
-    """将规则库转换为适合放入提示词的Markdown."""
-    lines = []
-    for rule in rules[:max_rules]:
-        lines.append(
-            "- "
-            f"[{rule.get('规则编号', '')}] "
-            f"{rule.get('一级分类(审查大类)', '')} / {rule.get('二级分类', '')} / "
-            f"{rule.get('审查项(审什么)', '')}\n"
-            f"  - 审查内容：{rule.get('审查内容说明', '')}\n"
-            f"  - 如何审核：{rule.get('如何审核(方法/步骤)', '')}\n"
-            f"  - 判定标准：{rule.get('判定标准(命中即提疑)', '')}\n"
-            f"  - 涉及专业/图纸：{rule.get('涉及专业', '')}；{rule.get('涉及图纸', '')}\n"
-            f"  - AI判定逻辑：{rule.get('AI判定逻辑', '')}\n"
-            f"  - 严重程度：{rule.get('严重程度', '')}；处理建议：{rule.get('处理建议', '')}"
-        )
-    if len(rules) > max_rules:
-        lines.append(f"\n（规则库共 {len(rules)} 条，本次提示词纳入前 {max_rules} 条；如需全量审核请分批执行。）")
-    return "\n".join(lines)
-
-
-def _format_review_prompt(doc: Document, rules: list[dict], custom_prompt: str) -> str:
-    """构建基于规则库的图纸审核提示词."""
-    rules_md = _rules_to_markdown(rules)
+def _format_review_prompt(doc: Document, rules: list[dict], cases: list[dict], custom_prompt: str) -> str:
+    """构建基于规则库+人工案例的图纸审核提示词（模板来自 prompts/drawing_review.md）."""
+    rules_md = drawing_rag.rules_to_markdown(rules)
+    cases_md = drawing_rag.cases_to_markdown(cases)
     extra = f"\n\n用户补充要求：{custom_prompt}" if custom_prompt else ""
-    return f"""
-你是专业施工图/装饰图审图工程师。请严格依据下方《AI审图依据·审查规则库》对上传图纸进行审核。
+    return load_prompt(
+        "drawing_review",
+        filename=doc.filename,
+        rules_md=rules_md,
+        cases_md=cases_md,
+        extra=extra,
+    )
 
-图纸文件：{doc.filename}
 
-审图规则库：
-{rules_md}
+def _render_rule_kb_status(project: Project):
+    """展示审图规则/人工案例知识库状态，并提供从 Excel 同步规则的入口."""
+    rule_count = drawing_rag.count_rules(project.id)
+    case_count = drawing_rag.count_cases(project.id)
 
-请按规则逐条或按分类审核，并输出结构化 Markdown，格式如下：
+    col_a, col_b, col_c = st.columns([1, 1, 2])
+    col_a.metric("审图规则（已入库）", rule_count)
+    col_b.metric("人工案例（已入库）", case_count)
 
-## 审核结论
-- 总体判断：通过 / 有疑问 / 不通过 / 信息不足
-- 命中问题数量：高/中/低分别统计
-- 信息不足但需人工复核的规则数量
+    with col_c:
+        xlsx_path = Path("data") / "projects" / str(project.id) / RULES_WORKBOOK_NAME
+        has_xlsx = xlsx_path.exists()
+        if st.button(
+            "🔄 同步规则到知识库",
+            key=f"sync_rules_{project.id}",
+            disabled=not has_xlsx,
+            help=None if has_xlsx else f"未找到规则库文件：{xlsx_path}",
+            width="stretch",
+        ):
+            with st.spinner("正在从 Excel 导入规则并向量化入库..."):
+                count, err = drawing_rag.import_rules_from_xlsx(project.id)
+            if err:
+                st.error(f"同步失败：{err}")
+            else:
+                st.success(f"已同步 {count} 条审图规则到知识库并完成向量化。")
+                st.rerun()
 
-## 标准提疑
-命中问题必须用表格输出，且表头固定为：规则编号｜部位｜问题描述｜涉及图纸｜严重程度｜建议｜可信度。
-
-特别要求：如果审核对象是多页 PDF，所有可定位到具体页面的问题，必须在“部位”字段开头写明页码，格式优先使用“第N页：具体部位/轴线/区域”，例如“第3页：客厅吊顶节点”；如果无法判断页码，写“页码未明确，需人工定位：具体部位”。
-
-字段要求：
-- 规则编号：引用规则库中的规则编号。
-- 部位：填写图纸中可识别的问题位置、房间、轴线、立面、节点、页码或区域；无法确认时写“图纸未明确，需人工定位”。
-- 问题描述：说明命中的疑点、冲突或缺失内容，必须基于图纸可见信息。
-- 涉及图纸：填写当前图纸名称，以及规则要求对比但当前缺失的图纸类型。
-- 严重程度：使用规则库中的严重程度；无法确认时按“待复核”。
-- 建议：引用或归纳规则库中的处理建议，说明下一步处理方式。
-- 可信度：按“高 / 中 / 低”填写；图纸信息清晰且规则直接命中为高，需要跨图纸但当前图纸缺失为中，图纸模糊或只能推测为低。
-
-## 未能判定/需补充图纸
-列出由于缺少土建、机电、节点、大样、材料表等图纸导致无法判断的规则，并说明需要补充哪些图纸。
-
-## 按专业汇总建议
-按装饰、土建、机电、消防、结构等专业汇总下一步处理建议。
-
-要求：
-1. 只能基于当前图纸图片可见内容和规则库判断，不要编造看不清的信息。
-2. 如果单张图纸无法完成跨专业比对，应标记为“信息不足/需补图”，不要直接判定通过。
-3. 每条疑点必须引用规则编号，并严格使用“标准提疑”的七列格式：[规则编号|部位|问题描述|涉及图纸|严重程度|建议|可信度]；多页 PDF 的“部位”字段必须尽量以“第N页：”开头。
-4. 如果没有可确认命中的提疑，也要输出“标准提疑”表格，并在问题描述中写“未发现可确认提疑，需结合完整图纸人工复核”。
-5. 输出中文。{extra}
-""".strip()
+    if rule_count == 0:
+        st.warning("审图规则知识库为空。请点击「同步规则到知识库」，将 Excel 规则库导入并向量化，随后即可进行 RAG 图纸审核。")
+    else:
+        st.caption(
+            f"✅ 审图规则以数据库为准（{rule_count} 条），审核时按图纸内容 RAG 检索最相关规则与 {case_count} 条人工案例。"
+        )
 
 
 def _status_text(status: str) -> str:
@@ -507,7 +454,7 @@ def _render_inline_chat(session_id: int, project_id: int, key_prefix: str, defau
 
 def _extract_standard_review_items(markdown_text: str) -> list[dict]:
     """从审核Markdown中提取标准提疑表格行."""
-    expected = ["规则编号", "部位", "问题描述", "涉及图纸", "严重程度", "建议", "可信度"]
+    expected = ["规则编号", "部位", "问题描述", "涉及图纸", "严重程度", "建议", "可信度", "坐标"]
     rows = []
     header = None
 
@@ -723,6 +670,81 @@ def _annotated_image_output_path(project_id: int, doc_id: int, image_path: Path,
     return output_dir / f"{safe_stem}_审核标注_{page_index + 1:03d}.png"
 
 
+def _parse_review_item_bbox(item: dict) -> tuple[float, float, float, float] | None:
+    """解析提疑“坐标”字段中的归一化 bbox（0-1000），返回 (x1,y1,x2,y2) 比例值 [0,1]。
+
+    模型输出格式约定为 "x1,y1,x2,y2"（0-1000）。无法解析或明确为“无”时返回 None。
+    """
+    raw = str(item.get("坐标", "") or "").strip()
+    if not raw or raw in {"无", "-", "—", "N/A", "n/a", "null", "None"}:
+        return None
+
+    nums = re.findall(r"-?\d+(?:\.\d+)?", raw)
+    if len(nums) < 4:
+        return None
+
+    try:
+        # 取末尾 4 个数，避免误取到“第N页”等前缀数字
+        x1, y1, x2, y2 = (float(n) for n in nums[-4:])
+    except ValueError:
+        return None
+
+    # 归一化到 [0,1]；若数值看起来是 0-1 之间的小数则直接用，否则按 0-1000 处理
+    scale = 1.0 if max(x1, y1, x2, y2) <= 1.0 else 1000.0
+    x1, y1, x2, y2 = x1 / scale, y1 / scale, x2 / scale, y2 / scale
+
+    # 规整顺序并裁剪到 [0,1]
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+    x1, y1, x2, y2 = (max(0.0, min(1.0, v)) for v in (x1, y1, x2, y2))
+
+    if x2 - x1 < 1e-3 or y2 - y1 < 1e-3:
+        return None
+    return x1, y1, x2, y2
+
+
+def _build_review_marker_image(image_path: Path, page_items: list[dict], output_path: Path) -> tuple[Path, int]:
+    """在原图上按“坐标”字段绘制编号方框/圆点，编号与右侧系统审核列表一致。
+
+    返回 (输出图路径, 已标注问题数)。无任何可定位坐标时仍复制原图，标注数为 0。
+    """
+    with Image.open(image_path) as source:
+        base_img = source.convert("RGB")
+
+    width, height = base_img.size
+    draw = ImageDraw.Draw(base_img, "RGBA")
+    line_w = max(2, round(min(width, height) / 400))
+    badge_r = max(12, round(min(width, height) / 90))
+    badge_font = _load_annotation_font(max(16, round(min(width, height) / 70)))
+
+    marked = 0
+    for idx, item in enumerate(page_items, start=1):
+        bbox = _parse_review_item_bbox(item)
+        if not bbox:
+            continue
+        marked += 1
+        x1, y1, x2, y2 = bbox
+        px1, py1, px2, py2 = x1 * width, y1 * height, x2 * width, y2 * height
+        color = _review_severity_color(item.get("严重程度", ""))
+
+        # 半透明填充 + 实线边框
+        draw.rectangle([px1, py1, px2, py2], fill=color + (46,), outline=color, width=line_w)
+
+        # 左上角编号徽标
+        bx, by = px1, py1
+        draw.ellipse(
+            [bx - badge_r, by - badge_r, bx + badge_r, by + badge_r],
+            fill=color, outline=(255, 255, 255), width=max(1, line_w // 2),
+        )
+        num = str(idx)
+        num_w, num_h = _text_size(draw, num, badge_font)
+        draw.text((bx - num_w / 2, by - num_h / 2 - 1), num, fill="white", font=badge_font)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    base_img.save(output_path, format="PNG")
+    return output_path, marked
+
+
 def _review_item_text_for_page_match(item: dict) -> str:
     """拼接可用于识别页码的审核提疑文本."""
     return " ".join(
@@ -821,15 +843,20 @@ def _save_manual_comments(doc_id: int, comments: dict):
         s.commit()
 
 
-def _add_manual_comment(doc_id: int, page_number: int, text: str):
-    """新增一条当前页人工批注."""
+def _add_manual_comment(doc_id: int, page_number: int, text: str,
+                        verdict: str = "manual", rule_code: str | None = None,
+                        location: str | None = None, problem: str | None = None,
+                        suggestion: str | None = None, severity: str | None = None):
+    """新增一条当前页人工批注，并自动向量化入人工案例知识库."""
     text = (text or "").strip()
     if not text:
         return
+    project_id = None
     with session() as s:
         doc_db = s.query(Document).filter(Document.id == doc_id).first()
         if not doc_db:
             return
+        project_id = doc_db.project_id
         data = {}
         if doc_db.analysis_data_json:
             try:
@@ -855,6 +882,26 @@ def _add_manual_comment(doc_id: int, page_number: int, text: str):
         data["manual_comments"] = comments
         doc_db.analysis_data_json = json.dumps(data, ensure_ascii=False, indent=2)
         s.commit()
+
+    # 人工反馈自动向量化入库，参与后续审核 RAG 检索
+    if project_id is not None:
+        try:
+            drawing_rag.add_review_case(
+                project_id=project_id,
+                text=text,
+                source_document_id=doc_id,
+                page_num=page_number,
+                rule_code=rule_code,
+                location=location,
+                problem=problem or (None if rule_code else text),
+                suggestion=suggestion,
+                severity=severity,
+                verdict=verdict,
+                author=_current_user_label(),
+            )
+        except Exception:
+            # 向量化失败不应阻断批注保存
+            pass
 
 
 def _update_manual_comment(doc_id: int, page_number: int, comment_id: str, text: str):
@@ -1181,12 +1228,37 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
 
     selected_index = 0
     if total_pages > 1:
-        selected_index = st.selectbox(
-            "选择标注图页码",
-            range(total_pages),
-            format_func=lambda i: f"第 {i + 1} 页 · 已匹配 {page_summary.get(i + 1, 0)} 条 · {image_paths[i].name}",
-            key=f"review_legend_page_{doc.id}",
-        )
+        page_key = f"review_legend_page_{doc.id}"
+        current = st.session_state.get(page_key, 0)
+        if not isinstance(current, int) or not (0 <= current < total_pages):
+            current = 0
+
+        col_prev, col_select, col_next = st.columns([1, 4, 1])
+        with col_prev:
+            if st.button(
+                "⬅️ 上一页",
+                key=f"review_legend_prev_{doc.id}",
+                disabled=current <= 0,
+                width="stretch",
+            ):
+                st.session_state[page_key] = current - 1
+                st.rerun()
+        with col_next:
+            if st.button(
+                "下一页 ➡️",
+                key=f"review_legend_next_{doc.id}",
+                disabled=current >= total_pages - 1,
+                width="stretch",
+            ):
+                st.session_state[page_key] = current + 1
+                st.rerun()
+        with col_select:
+            selected_index = st.selectbox(
+                "选择标注图页码",
+                range(total_pages),
+                format_func=lambda i: f"第 {i + 1} 页 · 已匹配 {page_summary.get(i + 1, 0)} 条 · {image_paths[i].name}",
+                key=page_key,
+            )
 
     page_number = selected_index + 1
     current_page_items, unknown_page_items = _split_review_items_for_page(review_items, page_number, total_pages)
@@ -1202,18 +1274,48 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
     current_image = image_paths[selected_index]
     page_comments = _get_page_manual_comments(analysis_data, page_number)
 
+    # 在原图上按 AI 估算坐标绘制编号标记（编号与右侧系统审核列表一致）
+    display_image = current_image
+    marked_count = 0
+    if any(_parse_review_item_bbox(it) for it in current_page_items):
+        marker_path = _annotated_image_output_path(doc.project_id, doc.id, current_image, selected_index)
+        try:
+            display_image, marked_count = _build_review_marker_image(
+                current_image, current_page_items, marker_path
+            )
+        except Exception:
+            display_image, marked_count = current_image, 0
+
     col_image, col_review, col_comments = st.columns([6, 2, 2])
 
+    # 读取“在图上放大”所选问题，计算需要居中放大的归一化坐标框
+    focus_key = f"review_focus_bbox_{doc.id}_{page_number}"
+    focus_idx = st.session_state.get(focus_key)
+    focus_bbox = None
+    if isinstance(focus_idx, int) and 1 <= focus_idx <= len(current_page_items):
+        focus_bbox = _parse_review_item_bbox(current_page_items[focus_idx - 1])
+    if not focus_bbox:
+        # 所选问题无坐标或状态失效时清除，避免残留
+        focus_idx = None
+
     with col_image:
-        # 暂不拼接审核问题侧栏，直接展示原始页图，并支持缩放。
+        if marked_count:
+            st.caption(f"已在图上标注 {marked_count} 处问题位置（编号与右侧系统审核一致，颜色对应严重程度；坐标由 AI 估算，仅供参考）。")
+        else:
+            st.caption("本页问题暂无可用于图上定位的坐标，显示原始页图。")
+        if focus_bbox:
+            st.caption(f"🔍 已定位到问题 {focus_idx}，图片自动放大居中；点查看器内“复位”可看整页。")
+        # key 随所选问题变化，确保 iframe 重新挂载并执行定位脚本
+        viewer_key = f"review_legend_image_{doc.id}_{selected_index}_focus{focus_idx or 0}"
         _render_full_resolution_image(
-            current_image,
+            display_image,
             f"第 {page_number} 页图纸",
-            key=f"review_legend_image_{doc.id}_{selected_index}",
+            key=viewer_key,
+            focus_bbox=focus_bbox,
         )
         st.download_button(
-            label="🖼️ 下载当前页图纸 PNG",
-            data=current_image.read_bytes(),
+            label="🖼️ 下载当前页标注图 PNG" if marked_count else "🖼️ 下载当前页图纸 PNG",
+            data=display_image.read_bytes(),
             file_name=f"{Path(doc.filename).stem}_第{page_number:03d}页.png",
             mime="image/png",
             key=f"download_review_legend_{doc.id}_{selected_index}",
@@ -1276,10 +1378,33 @@ def _render_page_review_items(doc: Document, page_number: int, page_items: list[
             elif verdict == "wrong":
                 st.info("已标记为不成立")
 
+            focus_key = f"review_focus_bbox_{doc.id}_{page_number}"
+            bbox = _parse_review_item_bbox(item)
+            is_focused = st.session_state.get(focus_key) == idx
+            if bbox:
+                if is_focused:
+                    if st.button("↩️ 取消放大", key=f"unfocus_{doc.id}_{page_number}_{idx}", width="stretch"):
+                        st.session_state.pop(focus_key, None)
+                        st.rerun()
+                else:
+                    if st.button(f"🔍 在图上放大问题 {idx}", key=f"focus_{doc.id}_{page_number}_{idx}", width="stretch"):
+                        st.session_state[focus_key] = idx
+                        st.rerun()
+            else:
+                st.caption("该问题无图上坐标，无法定位放大。")
+
             c1, c2 = st.columns(2)
             if c1.button("✅ 对", key=f"correct_{doc.id}_{page_number}_{idx}"):
                 if verdict != "correct":
-                    _add_manual_comment(doc.id, page_number, _review_item_confirm_text(item))
+                    _add_manual_comment(
+                        doc.id, page_number, _review_item_confirm_text(item),
+                        verdict="confirmed",
+                        rule_code=item.get("规则编号") or None,
+                        location=item.get("部位") or None,
+                        problem=item.get("问题描述") or None,
+                        suggestion=item.get("建议") or None,
+                        severity=item.get("严重程度") or None,
+                    )
                 st.session_state[verdict_key] = "correct"
                 st.rerun()
             if c2.button("❌ 错", key=f"wrong_{doc.id}_{page_number}_{idx}"):
@@ -1358,8 +1483,12 @@ def _render_manual_comments_ui(doc: Document, page_number: int, page_comments: l
                 st.warning("请输入批注内容。")
 
 
-def _render_full_resolution_image(image_path: Path, caption: str, key: str):
-    """在图片上方提供查看原图入口，并内嵌可缩放/拖动的图片查看器."""
+def _render_full_resolution_image(image_path: Path, caption: str, key: str,
+                                  focus_bbox: tuple[float, float, float, float] | None = None):
+    """在图片上方提供查看原图入口，并内嵌可缩放/拖动的图片查看器。
+
+    focus_bbox 为归一化 (x1,y1,x2,y2)（[0,1]）时，加载后自动放大并居中到该区域。
+    """
     try:
         with Image.open(image_path) as img:
             width, height = img.size
@@ -1369,7 +1498,11 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str):
 
     data = base64.b64encode(image_path.read_bytes()).decode("ascii")
     safe_key = re.sub(r"[^a-zA-Z0-9_-]", "_", key)
-    st.caption(f"{caption} · 原始 {width} × {height}px · 使用按钮或滚轮缩放，可拖动查看。")
+    focus_json = json.dumps(list(focus_bbox)) if focus_bbox else "null"
+    if focus_bbox:
+        st.caption(f"{caption} · 原始 {width} × {height}px · 已自动定位到所选问题；点“复位”查看整页，滚轮/按钮可缩放。")
+    else:
+        st.caption(f"{caption} · 原始 {width} × {height}px · 使用按钮或滚轮缩放，可拖动查看。")
     components.html(
         f"""
 <div style="font-family:sans-serif;">
@@ -1380,19 +1513,23 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str):
     <button id="reset-{safe_key}" style="padding:0.35rem 0.6rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">复位</button>
     <span id="pct-{safe_key}" style="color:#6b7280; font-size:0.9rem;">100%</span>
   </div>
-  <div id="frame-{safe_key}" style="border:1px solid #e5e7eb; border-radius:8px; background:#f9fafb; overflow:auto; max-height:640px; cursor:grab;">
+  <div id="frame-{safe_key}" style="border:1px solid #e5e7eb; border-radius:8px; background:#f9fafb; overflow:auto; max-height:640px; cursor:grab; position:relative;">
     <img id="img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px;" />
   </div>
 </div>
 <script>
 (function() {{
   const base64 = '{data}';
+  const focus = {focus_json};
   const img = document.getElementById('img-{safe_key}');
   const frame = document.getElementById('frame-{safe_key}');
   const pct = document.getElementById('pct-{safe_key}');
   const baseW = {width}, baseH = {height};
   let scale = 1;
 
+  function frameSize() {{
+    return [frame.clientWidth - 2 || baseW, frame.clientHeight - 2 || 640];
+  }}
   function fit() {{
     const avail = frame.clientWidth - 2;
     if (avail > 0 && baseW > 0) {{
@@ -1408,6 +1545,21 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str):
   function zoom(factor) {{
     scale = Math.min(8, Math.max(0.05, scale * factor));
     apply();
+  }}
+  function focusOn() {{
+    if (!focus) {{ fit(); return; }}
+    const bx1 = focus[0] * baseW, by1 = focus[1] * baseH;
+    const bx2 = focus[2] * baseW, by2 = focus[3] * baseH;
+    const bw = Math.max(1, bx2 - bx1), bh = Math.max(1, by2 - by1);
+    const [fw, fh] = frameSize();
+    // 让问题框约占视口 55%，并限制在合理缩放范围
+    let s = Math.min(fw / bw, fh / bh) * 0.55;
+    s = Math.min(8, Math.max(0.1, s));
+    scale = s;
+    apply();
+    const cx = ((bx1 + bx2) / 2) * scale, cy = ((by1 + by2) / 2) * scale;
+    frame.scrollLeft = Math.max(0, cx - fw / 2);
+    frame.scrollTop = Math.max(0, cy - fh / 2);
   }}
 
   document.getElementById('zoomin-{safe_key}').addEventListener('click', () => zoom(1.25));
@@ -1442,8 +1594,9 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str):
     window.open(url, '_blank', 'noopener,noreferrer');
   }});
 
-  fit();
-  window.addEventListener('resize', fit);
+  // 初次渲染：有定位框则放大居中，否则自适应
+  if (focus) {{ setTimeout(focusOn, 30); }} else {{ fit(); }}
+  window.addEventListener('resize', function() {{ if (focus) focusOn(); else fit(); }});
 }})();
 </script>
 """,
@@ -1798,6 +1951,128 @@ def _run_drawing_ai_job(
     return {**result, "image_count": len(image_paths), "analysis_data": analysis_data}
 
 
+def _run_review_triage(image_paths: list[Path], doc: Document, provider: str) -> tuple[str, dict]:
+    """第一阶段分诊：视觉识别图纸类型/专业/重点，返回 (检索查询字符串, 分诊原始数据)."""
+    prompt = load_prompt("review_triage", filename=doc.filename)
+    result = vision_chat(
+        query=prompt,
+        image_paths=[str(p) for p in image_paths],
+        session_id=None,
+        project_id=doc.project_id,
+        user_id=_user_id(),
+        provider=provider,
+        title=f"图纸分诊：{doc.filename}",
+    )
+    if result.get("error") or not result.get("answer"):
+        # 分诊失败时用文件名兜底
+        return doc.filename, {"error": result.get("error")}
+
+    answer = result["answer"].strip()
+    triage: dict = {}
+    # 容错解析 JSON（可能被代码块包裹）
+    match = re.search(r"\{.*\}", answer, flags=re.DOTALL)
+    if match:
+        try:
+            triage = json.loads(match.group(0))
+        except Exception:
+            triage = {}
+
+    keywords: list[str] = []
+    for field in ["review_focus", "key_elements", "drawing_types", "disciplines", "spaces"]:
+        value = triage.get(field)
+        if isinstance(value, list):
+            keywords.extend(str(v) for v in value if v)
+        elif isinstance(value, str) and value:
+            keywords.append(value)
+
+    query = " ".join(keywords) if keywords else doc.filename
+    triage["_query"] = query
+    triage["_raw"] = answer
+    return query, triage
+
+
+def _retrieve_review_context(project: Project, doc: Document, provider: str,
+                             image_paths: list[Path], custom_prompt: str) -> dict:
+    """两阶段 RAG 检索：分诊 -> 检索规则+案例。返回上下文 dict."""
+    query, triage = _run_review_triage(image_paths, doc, provider)
+    if custom_prompt:
+        query = f"{query} {custom_prompt}"
+
+    rules = drawing_rag.search_rules(project.id, query, top_k=15)
+    cases = drawing_rag.search_cases(project.id, query, top_k=6)
+
+    fallback = False
+    if not rules:
+        # RAG 未命中（例如规则尚未向量化）时回退全量规则，保证不退化
+        rules = drawing_rag.get_all_rules(project.id)
+        fallback = bool(rules)
+
+    return {
+        "query": query,
+        "triage": triage,
+        "rules": rules,
+        "cases": cases,
+        "fallback_all_rules": fallback,
+    }
+
+
+def _run_drawing_review_rag(project: Project, doc: Document, provider: str,
+                            custom_prompt: str) -> dict:
+    """图纸审核（RAG）：预处理 -> 分诊检索 -> 审核，并保存结果."""
+    with session() as s:
+        doc_db = s.query(Document).filter(Document.id == doc.id).first()
+        if doc_db:
+            doc_db.analysis_status = "running"
+            doc_db.analysis_error = None
+            s.commit()
+
+    image_paths, error = _prepare_drawing_images(doc, project.id)
+    if error:
+        _mark_doc_failed(doc.id, error)
+        return {"error": error}
+
+    ctx = _retrieve_review_context(project, doc, provider, image_paths, custom_prompt)
+    prompt = _format_review_prompt(doc, ctx["rules"], ctx["cases"], custom_prompt)
+
+    result = vision_chat(
+        query=prompt,
+        image_paths=[str(p) for p in image_paths],
+        session_id=None,
+        project_id=project.id,
+        user_id=_user_id(),
+        provider=provider,
+        title=f"{REVIEW_SESSION_PREFIX}{doc.filename}",
+    )
+    if result.get("error"):
+        _mark_doc_failed(doc.id, result["error"])
+        return result
+
+    analysis_data = {
+        "job_kind": "drawing_review",
+        "provider": provider,
+        "source_document_id": doc.id,
+        "source_document": doc.filename,
+        "preprocessed_images": [str(p) for p in image_paths],
+        "chat_session_id": result["session_id"],
+        "chat_message_id": result.get("message_id"),
+        "custom_prompt": custom_prompt,
+        "rag_query": ctx["query"],
+        "rag_triage": ctx["triage"],
+        "rag_rules_count": len(ctx["rules"]),
+        "rag_cases_count": len(ctx["cases"]),
+        "rag_fallback_all_rules": ctx["fallback_all_rules"],
+    }
+
+    _save_doc_analysis_result(doc.id, result["answer"] or "", analysis_data)
+    return {
+        **result,
+        "image_count": len(image_paths),
+        "analysis_data": analysis_data,
+        "rules_count": len(ctx["rules"]),
+        "cases_count": len(ctx["cases"]),
+    }
+
+
 def view_drawing_analysis_history(project: Project):
     """查看历史图纸分析页面."""
     st.title("📋 图纸分析历史")
@@ -1989,11 +2264,7 @@ def view_new_drawing_analysis(project: Project):
     st.divider()
     st.subheader("⚙️ 分析选项")
 
-    rules, rules_error = _load_review_rules(project.id)
-    if rules_error:
-        st.warning(rules_error)
-    else:
-        st.caption(f"✅ 已加载审图依据：data/projects/{project.id}/{RULES_WORKBOOK_NAME}，共 {len(rules)} 条规则。")
+    _render_rule_kb_status(project)
 
     analysis_type = st.multiselect(
         "选择分析类型",
@@ -2042,25 +2313,16 @@ def view_new_drawing_analysis(project: Project):
 
     with col_btn2:
         if st.button("✅ 图纸审核", type="secondary", width="stretch"):
-            rules, rules_error = _load_review_rules(project.id)
-            if rules_error:
-                st.error(rules_error)
+            if drawing_rag.count_rules(project.id) == 0:
+                st.error("审图规则知识库为空，请先在上方“审图规则知识库”中点击「同步规则到知识库」。")
                 st.stop()
 
-            prompt = _format_review_prompt(selected_doc, rules, custom_prompt)
-            with st.spinner("正在根据审图规则库预处理并审核图纸..."):
-                result = _run_drawing_ai_job(
+            with st.spinner("正在分诊图纸、检索相关规则与人工案例并审核..."):
+                result = _run_drawing_review_rag(
                     project=project,
                     doc=selected_doc,
                     provider=provider,
-                    title=f"{REVIEW_SESSION_PREFIX}{selected_doc.filename}",
-                    prompt=prompt,
-                    job_kind="drawing_review",
-                    extra_data={
-                        "custom_prompt": custom_prompt,
-                        "rules_workbook": RULES_WORKBOOK_NAME,
-                        "rules_count": len(rules),
-                    },
+                    custom_prompt=custom_prompt,
                 )
 
             if result.get("error"):
@@ -2069,8 +2331,9 @@ def view_new_drawing_analysis(project: Project):
 
             st.session_state["drawing_analysis_session_id"] = result["session_id"]
             st.success(
-                f"图纸审核完成，共生成/使用 {result.get('image_count', 0)} 张图片，"
-                f"已依据 {len(rules)} 条规则生成审核结果，并保存为可继续追问的会话。"
+                f"图纸审核完成，共生成/使用 {result.get('image_count', 0)} 张图片；"
+                f"RAG 检索出 {result.get('rules_count', 0)} 条相关规则、"
+                f"{result.get('cases_count', 0)} 条人工案例，结果已保存为可继续追问的会话。"
             )
             st.rerun()
 
