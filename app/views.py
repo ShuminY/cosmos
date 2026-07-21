@@ -98,6 +98,10 @@ def view_login():
                 "id": u.id, "email": u.email, "name": u.name, "role": u.role,
             }
             st.session_state.pop("auth_mode", None)
+            # 只有一个可见项目时，登录后自动选中，省去手动切换
+            projects = visible_projects(u.id)
+            if len(projects) == 1:
+                st.session_state["current_project_id"] = projects[0].id
             st.rerun()
 
     if get_setting("registration_open", True):

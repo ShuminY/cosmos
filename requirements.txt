@@ -31,6 +31,7 @@ bcrypt>=4.1
 streamlit>=1.40
 plotly>=5.20
 opencv-python>=4.9
+streamlit-drawable-canvas>=0.9  # 人工批注在图上拖拽画框选定位置
 
 # LLM
 openai>=1.0

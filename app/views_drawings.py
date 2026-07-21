@@ -5,6 +5,7 @@ import html
 import json
 import re
 import subprocess
+import time
 import uuid
 from datetime import datetime
 from functools import lru_cache
@@ -13,8 +14,41 @@ from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 
 import streamlit as st
-import streamlit.components.v1 as components
 from PIL import Image, ImageDraw, ImageFont
+
+# 人工批注在图上拖拽画框（可选依赖，缺失时回退为纯文本批注）
+try:
+    # streamlit-drawable-canvas 0.9.3 与新版 Streamlit 有两处不兼容，这里做兼容适配：
+    #  1) 该库从 streamlit.elements.image 引 image_to_url，但 Streamlit ≥1.34 已把该符号
+    #     迁移到 streamlit.elements.lib.image_utils
+    #  2) Streamlit ≥1.55 的 image_to_url 第二个参数变成 LayoutConfig 对象，而 canvas
+    #     仍按老签名传入一个 int width
+    from streamlit.elements import image as _st_image
+    if not hasattr(_st_image, "image_to_url"):
+        try:
+            from streamlit.elements.lib.image_utils import image_to_url as _image_to_url_new
+
+            try:
+                from streamlit.elements.lib.layout_utils import LayoutConfig as _LayoutConfig
+            except ImportError:
+                _LayoutConfig = None
+
+            def _image_to_url_compat(image, width, clamp, channels, output_format, image_id):
+                """兼容 canvas 的老式位置参数调用（width 是 int）→ 新 API（需要 LayoutConfig）。"""
+                if _LayoutConfig is not None and isinstance(width, int):
+                    layout_config = _LayoutConfig(width=width)
+                else:
+                    layout_config = width
+                return _image_to_url_new(image, layout_config, clamp, channels, output_format, image_id)
+
+            _st_image.image_to_url = _image_to_url_compat  # type: ignore[attr-defined]
+        except ImportError:
+            pass
+    from streamlit_drawable_canvas import st_canvas
+    CANVAS_AVAILABLE = True
+except ImportError:
+    st_canvas = None
+    CANVAS_AVAILABLE = False
 
 # PDF处理依赖：优先使用 PyMuPDF，避免本地环境必须安装 Poppler
 try:
@@ -78,6 +112,32 @@ def _save_uploaded_drawing(project_id: int, uploaded_file) -> int:
         doc_id = doc.id
         s.commit()
         return doc_id
+
+
+def _extract_labels_after_upload(project_id: int, doc_id: int) -> tuple[int, str | None]:
+    """上传成功后预处理 PDF→PNG 并自动提取页面名称（图名+图号）。
+
+    返回 (已识别命名的页数, 错误信息)。任何异常都被吞掉、只返回错误串，不影响主流程。
+    """
+    try:
+        with session() as s:
+            doc = s.query(Document).filter(Document.id == doc_id).first()
+            if not doc:
+                return 0, "上传后找不到文档记录"
+            # 提前 detach，后续函数会自开 session
+            s.expunge(doc)
+
+        image_paths, err = _prepare_drawing_images(doc, project_id)
+        if err:
+            return 0, err
+        if not image_paths:
+            return 0, "预处理后未生成图片"
+
+        labels = _ensure_page_labels(doc, project_id, image_paths, use_vision=True, force=True)
+        named = sum(1 for x in labels if (x.get("title") or x.get("code")))
+        return named, None
+    except Exception as e:
+        return 0, str(e)
 
 
 def _get_drawing_documents(project: Project):
@@ -171,6 +231,221 @@ def _prepare_drawing_images(doc: Document, project_id: int) -> tuple[list[Path],
         return [file_path], None
 
     return [], f"暂不支持该图纸格式: {suffix or '未知'}"
+
+
+# ============ 页面标题（图名 + 图号）提取 ============
+# 常见图号形式：P00 / P-02 / A-01 / GT-09 / J1-05 / M-101 等
+_SHEET_CODE_PATTERN = re.compile(
+    r"\b([A-Z]{1,3}\d{0,2}[\-\s]?\d{1,3})\b"
+)
+
+
+def _extract_pdf_sheet_codes(pdf_path: Path) -> list[str]:
+    """从多页 PDF 的文本层提取每页图号，返回长度==page_count 的字符串列表（缺失为空字符串）。
+
+    只依赖 PyMuPDF；PDF 中文名常有字体映射问题会读成乱码，所以图名不在这里抓，
+    另外交由视觉 LLM 处理。
+    """
+    if not PYMUPDF_AVAILABLE:
+        return []
+    try:
+        pdf_doc = fitz.open(str(pdf_path))
+    except Exception:
+        return []
+
+    results: list[str] = []
+    try:
+        for page_index in range(pdf_doc.page_count):
+            page = pdf_doc.load_page(page_index)
+            w, h = page.rect.width, page.rect.height
+            code = ""
+            best_score = -1.0
+            try:
+                text_dict = page.get_text("dict")
+            except Exception:
+                results.append("")
+                continue
+
+            for block in text_dict.get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                x0, y0, x1, y1 = block["bbox"]
+                cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                # 图号一般在页面右下角；用矩形距离右下角的比例作为得分（越靠右下越高）
+                if cy < h * 0.55 or cx < w * 0.55:
+                    continue
+                text = "".join(
+                    span["text"]
+                    for line in block.get("lines", [])
+                    for span in line.get("spans", [])
+                ).strip()
+                if not text:
+                    continue
+                for match in _SHEET_CODE_PATTERN.finditer(text):
+                    candidate = match.group(1).replace(" ", "").replace("-", "-").upper()
+                    # 得分：靠右下 + 单元格短（长文本里含相似模式的概率高）
+                    score = (cx / w) + (cy / h) - min(1.0, len(text) / 40)
+                    if score > best_score:
+                        best_score = score
+                        code = candidate
+            results.append(code)
+    finally:
+        pdf_doc.close()
+    return results
+
+
+def _extract_page_titles_via_vision(image_paths: list[Path], provider: str | None = None) -> list[dict]:
+    """用视觉模型批量提取每页的图名（右下角标题栏）。
+
+    每张图裁剪右下 40%×45% 区域后一起发给视觉模型，返回长度==len(image_paths) 的 dict 列表，
+    每个 dict 形如 {"title": "A户型平面图", "code": "P00"}（缺失字段为空串）。
+    """
+    if not image_paths:
+        return []
+
+    from src.chatbot import provider_openai_vision, load_provider_config, get_default_provider
+    if provider is None:
+        provider = get_default_provider()
+    provider_config = load_provider_config(provider)
+
+    # 生成裁剪图；写到 pdf_conversions 附近的临时目录
+    crops: list[Path] = []
+    for src in image_paths:
+        try:
+            with Image.open(src) as img:
+                w, h = img.size
+                # 右下 40% × 45%
+                box = (int(w * 0.60), int(h * 0.55), w, h)
+                crop = img.convert("RGB").crop(box)
+                crop_path = src.parent / f"__titleblock_{src.stem}.png"
+                crop.save(crop_path, format="PNG")
+                crops.append(crop_path)
+        except Exception:
+            crops.append(src)  # 兜底：整页也行，只是 token 更多
+
+    prompt = (
+        "以下每张图片都是一张建筑/装饰图纸右下角标题栏的裁剪。请按顺序输出每张图上"
+        "可读取的“图名”和“图号”。图号通常是字母+数字（如 P00、P-02、A-01、GT-09），"
+        "图名是紧邻图号的中文短语（如“A户型平面图”“客厅立面图”“天花吊顶图”）。\n"
+        "严格输出 JSON 数组，长度与图片数一致，每项是 {\"title\": \"...\", \"code\": \"...\"}。"
+        "无法识别时对应字段填空字符串。不要输出多余说明，也不要用 markdown 代码块包裹。"
+    )
+    answer, err = provider_openai_vision(prompt, provider_config, [str(p) for p in crops])
+    # 清理临时裁剪
+    for p in crops:
+        if p.name.startswith("__titleblock_"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    if err or not answer:
+        return [{"title": "", "code": ""} for _ in image_paths]
+
+    match = re.search(r"\[.*\]", answer, flags=re.DOTALL)
+    if not match:
+        return [{"title": "", "code": ""} for _ in image_paths]
+    try:
+        parsed = json.loads(match.group(0))
+    except Exception:
+        return [{"title": "", "code": ""} for _ in image_paths]
+
+    out: list[dict] = []
+    for i in range(len(image_paths)):
+        item = parsed[i] if i < len(parsed) and isinstance(parsed[i], dict) else {}
+        out.append({
+            "title": str(item.get("title", "") or "").strip(),
+            "code": str(item.get("code", "") or "").strip().upper(),
+        })
+    return out
+
+
+def _load_page_labels(analysis_data: dict) -> list[dict]:
+    """从 analysis_data 读取页面标签列表；缺失时返回空列表。
+
+    存储格式：analysis_data["page_labels"] = [{"title": "...", "code": "..."}, ...]
+    """
+    labels = analysis_data.get("page_labels")
+    if not isinstance(labels, list):
+        return []
+    return [
+        {"title": str(x.get("title", "") if isinstance(x, dict) else "").strip(),
+         "code": str(x.get("code", "") if isinstance(x, dict) else "").strip()}
+        for x in labels
+    ]
+
+
+def _format_page_label(labels: list[dict], page_number: int) -> str:
+    """将某页的 (title, code) 拼成显示后缀，如 "A户型平面区域图P00"。都没有返回空串。"""
+    idx = page_number - 1
+    if idx < 0 or idx >= len(labels):
+        return ""
+    title = labels[idx].get("title", "") or ""
+    code = labels[idx].get("code", "") or ""
+    if title and code:
+        return f"{title}{code}"
+    return title or code
+
+
+def _save_page_labels(doc_id: int, labels: list[dict]):
+    """把页面标签结果写回 Document.analysis_data_json.page_labels."""
+    with session() as s:
+        doc_db = s.query(Document).filter(Document.id == doc_id).first()
+        if not doc_db:
+            return
+        data = {}
+        if doc_db.analysis_data_json:
+            try:
+                data = json.loads(doc_db.analysis_data_json)
+            except json.JSONDecodeError:
+                data = {}
+        data["page_labels"] = labels
+        doc_db.analysis_data_json = json.dumps(data, ensure_ascii=False, indent=2)
+        s.commit()
+
+
+def _ensure_page_labels(doc: Document, project_id: int, image_paths: list[Path],
+                       use_vision: bool = True, provider: str | None = None,
+                       force: bool = False) -> list[dict]:
+    """确保 Document 有 page_labels；没有则先用 PDF 文本层提图号，再用视觉模型补图名。
+
+    - use_vision=False 时跳过 LLM 调用，只做文本层图号提取
+    - force=True 时忽略缓存重跑
+    - 返回最终的 labels 列表；空图纸/失败返回 []
+    """
+    if not image_paths:
+        return []
+
+    data = _parse_analysis_data(doc)
+    cached = _load_page_labels(data)
+    if not force and cached and len(cached) == len(image_paths):
+        return cached
+
+    total = len(image_paths)
+    labels = [{"title": "", "code": ""} for _ in range(total)]
+
+    # 1) 从 PDF 文本层抓图号
+    file_path = _doc_file_path(project_id, doc)
+    if file_path.suffix.lower() == ".pdf" and PYMUPDF_AVAILABLE:
+        codes = _extract_pdf_sheet_codes(file_path)
+        for i in range(min(total, len(codes))):
+            if codes[i]:
+                labels[i]["code"] = codes[i]
+
+    # 2) 视觉模型抓图名
+    if use_vision:
+        try:
+            vision_labels = _extract_page_titles_via_vision(image_paths, provider=provider)
+        except Exception:
+            vision_labels = []
+        for i in range(min(total, len(vision_labels))):
+            if vision_labels[i].get("title"):
+                labels[i]["title"] = vision_labels[i]["title"]
+            # 视觉模型抓到的图号只在文本层没读到时才用（PDF 文本层更权威）
+            if not labels[i]["code"] and vision_labels[i].get("code"):
+                labels[i]["code"] = vision_labels[i]["code"]
+
+    _save_page_labels(doc.id, labels)
+    return labels
 
 
 def _format_drawing_prompt(doc: Document, analysis_type: list[str], custom_prompt: str) -> str:
@@ -703,6 +978,27 @@ def _parse_review_item_bbox(item: dict) -> tuple[float, float, float, float] | N
     return x1, y1, x2, y2
 
 
+def _normalize_manual_bbox(bbox) -> tuple[float, float, float, float] | None:
+    """把 (x1,y1,x2,y2) 归一化到 [0,1]，排除越界/退化的框；缺失时返回 None。"""
+    if bbox is None:
+        return None
+    try:
+        x1, y1, x2, y2 = (float(v) for v in list(bbox)[:4])
+    except (TypeError, ValueError):
+        return None
+    # 若显然按像素/千分位输入（最大值明显 > 1.5），做一次尺度归一
+    m = max(abs(x1), abs(y1), abs(x2), abs(y2))
+    if m > 1.5:
+        scale = 1000.0 if m <= 1000.0 else m
+        x1, y1, x2, y2 = x1 / scale, y1 / scale, x2 / scale, y2 / scale
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+    x1, y1, x2, y2 = (max(0.0, min(1.0, v)) for v in (x1, y1, x2, y2))
+    if x2 - x1 < 1e-3 or y2 - y1 < 1e-3:
+        return None
+    return x1, y1, x2, y2
+
+
 def _build_review_marker_image(image_path: Path, page_items: list[dict], output_path: Path) -> tuple[Path, int]:
     """在原图上按“坐标”字段绘制编号方框/圆点，编号与右侧系统审核列表一致。
 
@@ -843,14 +1139,50 @@ def _save_manual_comments(doc_id: int, comments: dict):
         s.commit()
 
 
+def _comment_display_parts(comment: dict) -> tuple[str, str]:
+    """从批注 dict 里读出 (问题描述, 建议方案)。
+
+    新批注两字段独立存储；旧批注只有 text 时，返回 (text, '')，保证向后兼容。
+    """
+    problem = str(comment.get("problem", "") or "").strip()
+    suggestion = str(comment.get("suggestion", "") or "").strip()
+    if not problem and not suggestion:
+        legacy = str(comment.get("text", "") or "").strip()
+        return legacy, ""
+    return problem, suggestion
+
+
+def _compose_comment_text(problem: str, suggestion: str) -> str:
+    """把问题描述+建议方案拼成一段易读文本，用于向量化/单行渲染/导出兜底。"""
+    problem = (problem or "").strip()
+    suggestion = (suggestion or "").strip()
+    if problem and suggestion:
+        return f"问题：{problem}\n建议：{suggestion}"
+    if problem:
+        return problem
+    return suggestion
+
+
 def _add_manual_comment(doc_id: int, page_number: int, text: str,
                         verdict: str = "manual", rule_code: str | None = None,
                         location: str | None = None, problem: str | None = None,
-                        suggestion: str | None = None, severity: str | None = None):
-    """新增一条当前页人工批注，并自动向量化入人工案例知识库."""
+                        suggestion: str | None = None, severity: str | None = None,
+                        bbox: tuple[float, float, float, float] | list[float] | None = None):
+    """新增一条当前页人工批注，并自动向量化入人工案例知识库.
+
+    参数说明:
+      - text: 兼容旧调用；未拆分成 problem/suggestion 时的整合文本。
+      - problem / suggestion: 分开的“问题描述”和“建议方案”，两者至少一个非空即算有效。
+      - bbox: 可选归一化 (x1,y1,x2,y2)（[0,1]，左上原点），来自图上拖拽画框。
+    """
+    # 允许两种入参方式：拆分 problem/suggestion 优先；否则用 text
+    problem = (problem or "").strip()
+    suggestion = (suggestion or "").strip()
     text = (text or "").strip()
-    if not text:
+    composed = _compose_comment_text(problem, suggestion) if (problem or suggestion) else text
+    if not composed:
         return
+
     project_id = None
     with session() as s:
         doc_db = s.query(Document).filter(Document.id == doc_id).first()
@@ -871,13 +1203,20 @@ def _add_manual_comment(doc_id: int, page_number: int, text: str,
         if not isinstance(page_comments, list):
             page_comments = []
         stamp = now_utc().isoformat()
-        page_comments.append({
+        comment_row = {
             "id": f"c_{uuid.uuid4().hex[:8]}",
-            "text": text,
+            "problem": problem,
+            "suggestion": suggestion,
+            "text": composed,  # 兼容旧代码/导出兜底
             "author": _current_user_label(),
             "created_at": stamp,
             "updated_at": stamp,
-        })
+        }
+        # 归一化 bbox 后写入（越界或退化的框直接丢弃，避免脏数据）
+        norm_bbox = _normalize_manual_bbox(bbox)
+        if norm_bbox is not None:
+            comment_row["bbox"] = list(norm_bbox)
+        page_comments.append(comment_row)
         comments[page_key] = page_comments
         data["manual_comments"] = comments
         doc_db.analysis_data_json = json.dumps(data, ensure_ascii=False, indent=2)
@@ -888,13 +1227,13 @@ def _add_manual_comment(doc_id: int, page_number: int, text: str,
         try:
             drawing_rag.add_review_case(
                 project_id=project_id,
-                text=text,
+                text=composed,
                 source_document_id=doc_id,
                 page_num=page_number,
                 rule_code=rule_code,
                 location=location,
-                problem=problem or (None if rule_code else text),
-                suggestion=suggestion,
+                problem=problem or (None if rule_code else composed),
+                suggestion=suggestion or None,
                 severity=severity,
                 verdict=verdict,
                 author=_current_user_label(),
@@ -904,11 +1243,22 @@ def _add_manual_comment(doc_id: int, page_number: int, text: str,
             pass
 
 
-def _update_manual_comment(doc_id: int, page_number: int, comment_id: str, text: str):
-    """编辑一条当前页人工批注."""
-    text = (text or "").strip()
-    if not text:
+def _update_manual_comment(doc_id: int, page_number: int, comment_id: str,
+                           problem: str | None = None, suggestion: str | None = None,
+                           text: str | None = None):
+    """编辑一条当前页人工批注。
+
+    - 提供 problem/suggestion 时按新格式写；两者至少一个非空
+    - 只提供 text 时按旧格式写（向后兼容）
+    """
+    problem = (problem or "").strip() if problem is not None else None
+    suggestion = (suggestion or "").strip() if suggestion is not None else None
+    legacy_text = (text or "").strip() if text is not None else None
+
+    # 至少要有一个非空内容
+    if not any([problem, suggestion, legacy_text]):
         return
+
     with session() as s:
         doc_db = s.query(Document).filter(Document.id == doc_id).first()
         if not doc_db or not doc_db.analysis_data_json:
@@ -925,7 +1275,15 @@ def _update_manual_comment(doc_id: int, page_number: int, comment_id: str, text:
             return
         for comment in page_comments:
             if comment.get("id") == comment_id:
-                comment["text"] = text
+                if problem is not None or suggestion is not None:
+                    comment["problem"] = problem or ""
+                    comment["suggestion"] = suggestion or ""
+                    comment["text"] = _compose_comment_text(problem or "", suggestion or "")
+                elif legacy_text is not None:
+                    comment["text"] = legacy_text
+                    # 旧格式编辑时清空拆分字段，保持一致
+                    comment.pop("problem", None)
+                    comment.pop("suggestion", None)
                 comment["updated_at"] = now_utc().isoformat()
                 break
         data["manual_comments"] = comments
@@ -1076,7 +1434,7 @@ def _draw_manual_comments_section(draw, manual_comments, width, sidebar_width, h
 
     for idx, comment in enumerate(comments, start=1):
         author = comment.get("author", "") or "匿名用户"
-        text = comment.get("text", "") or ""
+        problem_val, suggestion_val = _comment_display_parts(comment)
         created_at = comment.get("created_at", "")
         time_str = ""
         if created_at:
@@ -1087,8 +1445,24 @@ def _draw_manual_comments_section(draw, manual_comments, width, sidebar_width, h
 
         header = f"{idx}. {author}" + (f" · {time_str}" if time_str else "")
         header_lines = _wrap_text_for_draw(draw, header, small_font, max_text_width)
-        text_lines = _wrap_text_for_draw(draw, text, body_font, max_text_width)
-        block_height = len(header_lines) * (small_h + 3) + len(text_lines) * (body_h + 4) + 12
+
+        # 问题描述 / 建议方案 两段独立渲染；缺失字段用兜底
+        body_segments: list[tuple[str, tuple[int, int, int]]] = []
+        if problem_val:
+            body_segments.append((f"问题：{problem_val}", (31, 41, 55)))
+        if suggestion_val:
+            body_segments.append((f"建议：{suggestion_val}", (55, 65, 81)))
+        if not body_segments:
+            legacy = str(comment.get("text", "") or "")
+            if legacy:
+                body_segments.append((legacy, (31, 41, 55)))
+
+        wrapped_body: list[tuple[list[str], tuple[int, int, int]]] = [
+            (_wrap_text_for_draw(draw, seg, body_font, max_text_width), color)
+            for seg, color in body_segments
+        ]
+        body_line_count = sum(len(lines) for lines, _ in wrapped_body)
+        block_height = len(header_lines) * (small_h + 3) + body_line_count * (body_h + 4) + 12
 
         if y + block_height > height - padding:
             remaining = len(comments) - idx + 1
@@ -1102,9 +1476,10 @@ def _draw_manual_comments_section(draw, manual_comments, width, sidebar_width, h
         for line in header_lines:
             draw.text((width + padding, y), line, fill=(37, 99, 235), font=small_font)
             y += small_h + 3
-        for line in text_lines:
-            draw.text((width + padding, y), line, fill=(31, 41, 55), font=body_font)
-            y += body_h + 4
+        for body_lines, color in wrapped_body:
+            for line in body_lines:
+                draw.text((width + padding, y), line, fill=color, font=body_font)
+                y += body_h + 4
         y += 10
 
 
@@ -1131,10 +1506,22 @@ def _build_comment_stitched_image(image_path: Path, page_number: int, comments: 
     comment_gap = 16
     max_text_width = sidebar_width - padding * 2
 
+    def _segments_of(comment: dict) -> list[tuple[str, tuple[int, int, int]]]:
+        problem_val, suggestion_val = _comment_display_parts(comment)
+        segs: list[tuple[str, tuple[int, int, int]]] = []
+        if problem_val:
+            segs.append((f"问题：{problem_val}", (31, 41, 55)))
+        if suggestion_val:
+            segs.append((f"建议：{suggestion_val}", (55, 65, 81)))
+        if not segs:
+            legacy = str(comment.get("text", "") or "")
+            if legacy:
+                segs.append((legacy, (31, 41, 55)))
+        return segs
+
     needed = padding + title_h + 18
     for idx, comment in enumerate(comments, start=1):
         author = comment.get("author", "") or "匿名用户"
-        text = comment.get("text", "") or ""
         created_at = comment.get("created_at", "")
         time_str = ""
         if created_at:
@@ -1144,8 +1531,10 @@ def _build_comment_stitched_image(image_path: Path, page_number: int, comments: 
                 time_str = ""
         header = f"{idx}. {author}" + (f" · {time_str}" if time_str else "")
         header_lines = _wrap_text_for_draw(measure, header, small_font, max_text_width)
-        text_lines = _wrap_text_for_draw(measure, text, body_font, max_text_width)
-        needed += len(header_lines) * small_h + len(text_lines) * body_h + comment_gap
+        body_line_count = 0
+        for seg, _ in _segments_of(comment):
+            body_line_count += len(_wrap_text_for_draw(measure, seg, body_font, max_text_width))
+        needed += len(header_lines) * small_h + body_line_count * body_h + comment_gap
     needed += padding
 
     canvas_height = max(height, needed)
@@ -1167,7 +1556,6 @@ def _build_comment_stitched_image(image_path: Path, page_number: int, comments: 
 
     for idx, comment in enumerate(comments, start=1):
         author = comment.get("author", "") or "匿名用户"
-        text = comment.get("text", "") or ""
         created_at = comment.get("created_at", "")
         time_str = ""
         if created_at:
@@ -1179,9 +1567,10 @@ def _build_comment_stitched_image(image_path: Path, page_number: int, comments: 
         for line in _wrap_text_for_draw(draw, header, small_font, max_text_width):
             draw.text((width + padding, y), line, fill=(37, 99, 235), font=small_font)
             y += small_h
-        for line in _wrap_text_for_draw(draw, text, body_font, max_text_width):
-            draw.text((width + padding, y), line, fill=(31, 41, 55), font=body_font)
-            y += body_h
+        for seg, color in _segments_of(comment):
+            for line in _wrap_text_for_draw(draw, seg, body_font, max_text_width):
+                draw.text((width + padding, y), line, fill=color, font=body_font)
+                y += body_h
         y += comment_gap
 
     return annotated
@@ -1225,6 +1614,15 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
 
     total_pages = len(image_paths)
     page_summary = _review_page_match_summary(review_items, total_pages)
+    page_labels = _load_page_labels(analysis_data)
+
+    def _page_display(idx: int) -> str:
+        n = idx + 1
+        label = _format_page_label(page_labels, n)
+        base = f"第 {n} 页"
+        if label:
+            base = f"{base}{label}"
+        return f"{base} · 已匹配 {page_summary.get(n, 0)} 条 · {image_paths[idx].name}"
 
     selected_index = 0
     if total_pages > 1:
@@ -1256,15 +1654,19 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
             selected_index = st.selectbox(
                 "选择标注图页码",
                 range(total_pages),
-                format_func=lambda i: f"第 {i + 1} 页 · 已匹配 {page_summary.get(i + 1, 0)} 条 · {image_paths[i].name}",
+                format_func=_page_display,
                 key=page_key,
             )
 
     page_number = selected_index + 1
+    page_label_suffix = _format_page_label(page_labels, page_number)
     current_page_items, unknown_page_items = _split_review_items_for_page(review_items, page_number, total_pages)
     if total_pages > 1:
+        page_display = f"第 {page_number} 页"
+        if page_label_suffix:
+            page_display = f"第 {page_number} 页 {page_label_suffix}"
         st.caption(
-            f"当前第 {page_number} 页：显示 {len(current_page_items)} 条已明确匹配到本页的审核问题；"
+            f"当前{page_display}：显示 {len(current_page_items)} 条已明确匹配到本页的审核问题；"
             f"{len(unknown_page_items)} 条未识别页码的问题未标到具体页面。"
         )
         if unknown_page_items:
@@ -1307,9 +1709,12 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
             st.caption(f"🔍 已定位到问题 {focus_idx}，图片自动放大居中；点查看器内“复位”可看整页。")
         # key 随所选问题变化，确保 iframe 重新挂载并执行定位脚本
         viewer_key = f"review_legend_image_{doc.id}_{selected_index}_focus{focus_idx or 0}"
+        caption_title = f"第 {page_number} 页图纸"
+        if page_label_suffix:
+            caption_title = f"第 {page_number} 页 {page_label_suffix}"
         _render_full_resolution_image(
             display_image,
-            f"第 {page_number} 页图纸",
+            caption_title,
             key=viewer_key,
             focus_bbox=focus_bbox,
         )
@@ -1322,10 +1727,13 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
         )
 
     with col_review:
-        _render_page_review_items(doc, page_number, current_page_items)
+        _render_page_review_items(doc, page_number, current_page_items,
+                                  page_label_suffix=page_label_suffix)
 
     with col_comments:
-        _render_manual_comments_ui(doc, page_number, page_comments)
+        _render_manual_comments_ui(doc, page_number, page_comments,
+                                   page_image_path=current_image,
+                                   page_label_suffix=page_label_suffix)
 
 
 def _review_item_confirm_text(item: dict) -> str:
@@ -1341,9 +1749,13 @@ def _review_item_confirm_text(item: dict) -> str:
     return "\n".join(lines)
 
 
-def _render_page_review_items(doc: Document, page_number: int, page_items: list[dict]):
+def _render_page_review_items(doc: Document, page_number: int, page_items: list[dict],
+                              page_label_suffix: str = ""):
     """按 1、2、3 分条展示当前页系统审核问题，支持人工对错确认."""
-    st.markdown(f"#### 🔍 第 {page_number} 页系统审核")
+    header = f"第 {page_number} 页"
+    if page_label_suffix:
+        header = f"{header} {page_label_suffix}"
+    st.markdown(f"#### 🔍 {header} · 系统审核")
     if not page_items:
         st.caption("本页暂无匹配到页码的系统审核问题。")
         return
@@ -1422,9 +1834,18 @@ def _estimate_text_area_height(text: str) -> int:
     return max(80, min(400, lines * 26 + 20))
 
 
-def _render_manual_comments_ui(doc: Document, page_number: int, page_comments: list[dict]):
-    """当前页人工批注的增删改界面（显示在图片右侧）."""
-    st.markdown(f"#### 📝 第 {page_number} 页人工批注")
+def _render_manual_comments_ui(doc: Document, page_number: int, page_comments: list[dict],
+                               page_image_path: Path | None = None,
+                               page_label_suffix: str = ""):
+    """当前页人工批注的增删改界面（显示在图片右侧）。
+
+    page_image_path: 当前页 PNG 路径；提供后新增批注支持在图上拖拽画框选定位置。
+    page_label_suffix: 图名+图号后缀（例如 "A户型平面图 P00"），有则拼在标题里。
+    """
+    header = f"第 {page_number} 页"
+    if page_label_suffix:
+        header = f"{header} {page_label_suffix}"
+    st.markdown(f"#### 📝 {header} · 人工批注")
     st.caption("批注保存到本审核结果中，按页码记录。")
 
     if page_comments:
@@ -1439,25 +1860,51 @@ def _render_manual_comments_ui(doc: Document, page_number: int, page_comments: l
                 except Exception:
                     time_str = ""
             edit_key = f"edit_comment_{doc.id}_{page_number}_{comment_id}"
+            problem_val, suggestion_val = _comment_display_parts(comment)
             with st.container(border=True):
                 st.markdown(f"**{idx}. {author}**" + (f" · {time_str}" if time_str else ""))
                 if st.session_state.get(edit_key, False):
-                    new_text = st.text_area(
-                        "编辑批注",
-                        value=comment.get("text", ""),
-                        key=f"edit_text_{doc.id}_{page_number}_{comment_id}",
-                        height=_estimate_text_area_height(comment.get("text", "")),
+                    new_problem = st.text_area(
+                        "问题描述",
+                        value=problem_val,
+                        key=f"edit_problem_{doc.id}_{page_number}_{comment_id}",
+                        height=_estimate_text_area_height(problem_val),
+                    )
+                    new_suggestion = st.text_area(
+                        "建议方案",
+                        value=suggestion_val,
+                        key=f"edit_suggestion_{doc.id}_{page_number}_{comment_id}",
+                        height=_estimate_text_area_height(suggestion_val),
                     )
                     c1, c2 = st.columns(2)
                     if c1.button("保存", key=f"save_{doc.id}_{page_number}_{comment_id}", type="primary"):
-                        _update_manual_comment(doc.id, page_number, comment_id, new_text)
-                        st.session_state[edit_key] = False
-                        st.rerun()
+                        if not (new_problem.strip() or new_suggestion.strip()):
+                            st.warning("请至少填写“问题描述”或“建议方案”其中之一。")
+                        else:
+                            _update_manual_comment(
+                                doc.id, page_number, comment_id,
+                                problem=new_problem, suggestion=new_suggestion,
+                            )
+                            st.session_state[edit_key] = False
+                            st.rerun()
                     if c2.button("取消", key=f"cancel_{doc.id}_{page_number}_{comment_id}"):
                         st.session_state[edit_key] = False
                         st.rerun()
                 else:
-                    st.markdown(comment.get("text", ""))
+                    if problem_val:
+                        st.markdown(f"**问题描述：** {problem_val}")
+                    if suggestion_val:
+                        st.markdown(f"**建议方案：** {suggestion_val}")
+                    if not problem_val and not suggestion_val:
+                        # 极端兜底：两段都为空但历史 text 也为空的行
+                        st.markdown(comment.get("text", ""))
+                    bbox = comment.get("bbox")
+                    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                        st.caption(
+                            "📍 已标注图上位置："
+                            f"({bbox[0]*100:.0f}%, {bbox[1]*100:.0f}%) → "
+                            f"({bbox[2]*100:.0f}%, {bbox[3]*100:.0f}%)"
+                        )
                     c1, c2 = st.columns(2)
                     if c1.button("✏️ 编辑", key=f"editbtn_{doc.id}_{page_number}_{comment_id}"):
                         st.session_state[edit_key] = True
@@ -1468,19 +1915,138 @@ def _render_manual_comments_ui(doc: Document, page_number: int, page_comments: l
     else:
         st.caption("本页暂无人工批注。")
 
-    with st.form(key=f"add_comment_{doc.id}_{page_number}", clear_on_submit=True):
-        new_comment = st.text_area(
-            "新增人工批注",
-            placeholder="输入需要标注在右侧的人工批注...",
+    _render_add_manual_comment(doc, page_number, page_comments, page_image_path)
+
+
+def _render_add_manual_comment(doc: Document, page_number: int, page_comments: list[dict],
+                               page_image_path: Path | None):
+    """新增批注：问题描述 + 建议方案 + 可选的“图上拖拽画框”定位。"""
+    st.markdown("**➕ 新增人工批注**")
+    # 画框选区放在 form 外面：canvas 是独立组件，需要每次交互就把结果回传。
+    bbox_norm = _render_manual_bbox_picker(doc, page_number, page_comments, page_image_path)
+
+    # 用 form + clear_on_submit=True，提交成功后 Streamlit 自动清空表单内所有输入。
+    form_key = f"new_comment_form_{doc.id}_{page_number}"
+    with st.form(key=form_key, clear_on_submit=True):
+        new_problem = st.text_area(
+            "问题描述",
+            placeholder="描述在图上发现的问题（例如：卫生间防水返高不足）...",
             height=80,
-            key=f"new_comment_{doc.id}_{page_number}",
+            key=f"new_comment_problem_{doc.id}_{page_number}",
         )
-        if st.form_submit_button("➕ 添加批注", type="primary"):
-            if new_comment.strip():
-                _add_manual_comment(doc.id, page_number, new_comment)
-                st.rerun()
-            else:
-                st.warning("请输入批注内容。")
+        new_suggestion = st.text_area(
+            "建议方案",
+            placeholder="给出处理/整改建议（例如：将防水返高至 300mm）...",
+            height=80,
+            key=f"new_comment_suggestion_{doc.id}_{page_number}",
+        )
+        submitted = st.form_submit_button("➕ 添加批注", type="primary")
+
+    if submitted:
+        if not (new_problem.strip() or new_suggestion.strip()):
+            st.warning("请至少填写“问题描述”或“建议方案”其中之一。")
+            return
+        _add_manual_comment(
+            doc.id, page_number, text="",
+            problem=new_problem, suggestion=new_suggestion,
+            bbox=bbox_norm,
+        )
+        st.rerun()
+
+
+def _canvas_display_size(width: int, height: int, max_width: int = 520, max_height: int = 520) -> tuple[int, int]:
+    """在保持长宽比的前提下把大图缩到可绘制画布尺寸，返回 (画布宽, 画布高)."""
+    if width <= 0 or height <= 0:
+        return max_width, max_height
+    scale = min(max_width / width, max_height / height, 1.0)
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
+
+def _bbox_to_canvas_rect(bbox: list | tuple, canvas_w: int, canvas_h: int, stroke_color: str = "#22c55e") -> dict:
+    """把归一化 bbox 转成 st_canvas initial_drawing 里的一个矩形对象."""
+    x1, y1, x2, y2 = (float(v) for v in bbox[:4])
+    return {
+        "type": "rect",
+        "left": x1 * canvas_w,
+        "top": y1 * canvas_h,
+        "width": max(1.0, (x2 - x1) * canvas_w),
+        "height": max(1.0, (y2 - y1) * canvas_h),
+        "fill": "rgba(34, 197, 94, 0.10)",
+        "stroke": stroke_color,
+        "strokeWidth": 2,
+        "selectable": False,
+        "evented": False,
+        "hoverCursor": "default",
+    }
+
+
+def _render_manual_bbox_picker(doc: Document, page_number: int, page_comments: list[dict],
+                               page_image_path: Path | None) -> tuple[float, float, float, float] | None:
+    """在图上拖拽画一个矩形选定批注位置；返回归一化 bbox 或 None."""
+    if page_image_path is None or not page_image_path.exists():
+        return None
+    if not CANVAS_AVAILABLE:
+        st.caption("💡 提示：安装 `streamlit-drawable-canvas` 后可在图上拖拽画框选定批注位置。")
+        return None
+
+    try:
+        with Image.open(page_image_path) as bg:
+            bg = bg.convert("RGB")
+            orig_w, orig_h = bg.size
+            canvas_w, canvas_h = _canvas_display_size(orig_w, orig_h)
+            preview = bg.resize((canvas_w, canvas_h))
+    except Exception:
+        return None
+
+    # 把当前页已有的人工批注框作为绿色只读矩形叠在背景上，避免用户重复标注
+    existing_rects = []
+    for c in page_comments:
+        b = c.get("bbox")
+        if isinstance(b, (list, tuple)) and len(b) == 4:
+            existing_rects.append(_bbox_to_canvas_rect(b, canvas_w, canvas_h, stroke_color="#22c55e"))
+
+    st.caption("在下方图上按住鼠标**拖拽画一个矩形**来标注问题位置（已有的绿色框为历史批注）。不需要画时留空即可。")
+    canvas_result = st_canvas(
+        fill_color="rgba(239, 68, 68, 0.12)",
+        stroke_width=2,
+        stroke_color="#ef4444",
+        background_image=preview,
+        update_streamlit=True,
+        height=canvas_h,
+        width=canvas_w,
+        drawing_mode="rect",
+        display_toolbar=True,
+        initial_drawing={"version": "4.4.0", "objects": existing_rects} if existing_rects else None,
+        key=f"canvas_{doc.id}_{page_number}",
+    )
+
+    # 取最后一个由用户新画的矩形（初始的绿色矩形是 selectable=False，不会出现在这里）
+    if canvas_result is None or canvas_result.json_data is None:
+        return None
+    new_rects = [
+        obj for obj in canvas_result.json_data.get("objects", [])
+        if obj.get("type") == "rect" and obj.get("selectable", True)
+    ]
+    if not new_rects:
+        return None
+    last = new_rects[-1]
+    left = float(last.get("left", 0))
+    top = float(last.get("top", 0))
+    w = float(last.get("width", 0)) * float(last.get("scaleX", 1) or 1)
+    h = float(last.get("height", 0)) * float(last.get("scaleY", 1) or 1)
+    if w <= 0 or h <= 0:
+        return None
+    x1 = left / canvas_w
+    y1 = top / canvas_h
+    x2 = (left + w) / canvas_w
+    y2 = (top + h) / canvas_h
+    bbox = _normalize_manual_bbox((x1, y1, x2, y2))
+    if bbox:
+        st.caption(
+            f"✅ 已选定位置：({bbox[0]*100:.0f}%, {bbox[1]*100:.0f}%) → "
+            f"({bbox[2]*100:.0f}%, {bbox[3]*100:.0f}%)"
+        )
+    return bbox
 
 
 def _render_full_resolution_image(image_path: Path, caption: str, key: str,
@@ -1503,7 +2069,7 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
         st.caption(f"{caption} · 原始 {width} × {height}px · 已自动定位到所选问题；点“复位”查看整页，滚轮/按钮可缩放。")
     else:
         st.caption(f"{caption} · 原始 {width} × {height}px · 使用按钮或滚轮缩放，可拖动查看。")
-    components.html(
+    st.iframe(
         f"""
 <div style="font-family:sans-serif;">
   <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
@@ -1619,6 +2185,10 @@ def _export_review_as_markdown(doc: Document, review_items: list[dict]) -> str:
     lines.append(f"**项目 ID:** {doc.project_id}")
     if doc.analyzed_at:
         lines.append(f"**审核时间:** {format_beijing(doc.analyzed_at, '%Y-%m-%d %H:%M:%S')}")
+    _analysis_data = _parse_analysis_data(doc)
+    _duration_txt = _format_duration_seconds(_analysis_data.get("duration_seconds"))
+    if _duration_txt:
+        lines.append(f"**AI 用时:** {_duration_txt}")
     lines.append("")
 
     if review_items:
@@ -1659,22 +2229,128 @@ def _export_review_as_csv(review_items: list[dict]) -> str:
 
 
 def _export_manual_comments_xlsx(doc: Document, analysis_data: dict) -> bytes | None:
-    """将所有页的人工批注导出为 Excel 字节流；无批注时返回 None."""
+    """将所有页的人工批注导出为 Excel 字节流；无批注时返回 None.
+
+    导出列（10 列）：
+      问题编号 · 图纸名称/图号 · 问题描述 · 图片附件（嵌入本页缩略图）·
+      建议方案 · 回复意见 · 回复时间 · 提疑人 · 状态 · 备注
+    未来在 UI 里加了「回复意见/时间/状态/备注」等字段，会自动生效；
+    当前未存的字段留空，供外部在 Excel 中手工补写。
+    """
     comments_by_page = _load_manual_comments(analysis_data)
     if not comments_by_page:
         return None
 
-    # 按页码顺序整理
     def _page_num(key: str) -> int:
         try:
             return int(str(key).replace("page_", ""))
         except ValueError:
             return 0
 
-    rows = []
+    # 预处理页图像路径，用于图片附件嵌入
+    preprocessed = [Path(p) for p in analysis_data.get("preprocessed_images", []) if Path(p).exists()]
+    page_labels = _load_page_labels(analysis_data)
+
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+    from openpyxl.drawing.image import Image as XLImage
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "人工批注"
+    headers = [
+        "问题编号", "图纸名称/图号", "问题描述", "图片附件",
+        "建议方案", "回复意见", "回复时间", "提疑人", "状态", "备注",
+    ]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # 列宽（图片列相对宽一点以容纳嵌入的原图缩略）
+    widths = [12, 22, 42, 38, 42, 30, 18, 14, 12, 24]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + i)].width = w
+
+    # 图片附件：优先每条批注一张（带 bbox 的画在图上），无 bbox 的按页共用一张原图。
+    # 存在 xlsx_attachments/ 下便于复用；保留完整原图分辨率（Excel 显示时会等比缩放，双击可查看原图）。
+    attach_dir = Path("data") / "projects" / str(doc.project_id) / "annotated_drawings" / str(doc.id) / "xlsx_attachments"
+    attach_cache: dict[str, Path] = {}
+
+    def _attachment_for(page_number: int, comment: dict) -> Path | None:
+        """返回本条批注对应的原图附件；有 bbox 就在原图上画出，无 bbox 就用整页原图.
+
+        缓存 key 兼顾去重：无 bbox 用页号；有 bbox 用 comment_id，避免不同 bbox 的批注共用同一张图。
+        """
+        if not (1 <= page_number <= len(preprocessed)):
+            return None
+        bbox_raw = comment.get("bbox")
+        bbox: tuple[float, float, float, float] | None = None
+        if isinstance(bbox_raw, (list, tuple)) and len(bbox_raw) == 4:
+            try:
+                bbox = tuple(float(v) for v in bbox_raw)  # type: ignore[assignment]
+            except (TypeError, ValueError):
+                bbox = None
+
+        cache_key = (
+            f"p{page_number:03d}_c{comment.get('id', 'x')}"
+            if bbox else f"p{page_number:03d}_plain"
+        )
+        if cache_key in attach_cache:
+            return attach_cache[cache_key]
+
+        src = preprocessed[page_number - 1]
+        attach_dir.mkdir(parents=True, exist_ok=True)
+        dest = attach_dir / f"{cache_key}.png"
+        try:
+            if not dest.exists():
+                with Image.open(src) as img:
+                    base = img.convert("RGB")
+                    if bbox is not None:
+                        # 保留原图分辨率，直接在原图上画标注
+                        w, h = base.size
+                        x1, y1, x2, y2 = bbox
+                        # 夹紧到 [0,1] 并转成像素
+                        x1p = int(max(0.0, min(1.0, min(x1, x2))) * w)
+                        y1p = int(max(0.0, min(1.0, min(y1, y2))) * h)
+                        x2p = int(max(0.0, min(1.0, max(x1, x2))) * w)
+                        y2p = int(max(0.0, min(1.0, max(y1, y2))) * h)
+                        if x2p > x1p and y2p > y1p:
+                            annotated = base.copy()
+                            drw = ImageDraw.Draw(annotated, "RGBA")
+                            # 描边宽度按图大小自适应（大图不刺眼、小图看得清）
+                            line_w = max(3, round(min(w, h) / 300))
+                            # 半透明填充 + 实线边框（跟 UI 里的画框选区色调保持一致 #22c55e）
+                            drw.rectangle(
+                                [x1p, y1p, x2p, y2p],
+                                fill=(34, 197, 94, 60),
+                                outline=(22, 163, 74, 255),
+                                width=line_w,
+                            )
+                            annotated.save(dest, format="PNG")
+                        else:
+                            base.save(dest, format="PNG")
+                    else:
+                        base.save(dest, format="PNG")
+        except Exception:
+            return None
+
+        attach_cache[cache_key] = dest
+        return dest
+
+    row_idx = 2  # 表头是第 1 行
+    global_seq = 0
     for page_key in sorted(comments_by_page.keys(), key=_page_num):
+        page_num = _page_num(page_key)
         page_comments = comments_by_page.get(page_key) or []
-        for idx, comment in enumerate(page_comments, start=1):
+        # 图纸名称/图号：优先 图名+图号，其次仅图号，最后 "第N页"
+        label_suffix = _format_page_label(page_labels, page_num)
+        sheet_label = label_suffix or f"第 {page_num} 页"
+
+        for local_idx, comment in enumerate(page_comments, start=1):
+            global_seq += 1
+            problem_val, suggestion_val = _comment_display_parts(comment)
             created_at = comment.get("created_at", "")
             time_str = ""
             if created_at:
@@ -1682,36 +2358,67 @@ def _export_manual_comments_xlsx(doc: Document, analysis_data: dict) -> bytes | 
                     time_str = format_beijing(datetime.fromisoformat(created_at), "%Y-%m-%d %H:%M")
                 except Exception:
                     time_str = created_at
-            rows.append([
-                _page_num(page_key),
-                idx,
-                comment.get("author", "") or "匿名用户",
-                comment.get("text", "") or "",
-                time_str,
-            ])
 
-    if not rows:
+            issue_code = f"P{page_num:02d}-{local_idx:02d}"  # 例如 P13-01
+            author = comment.get("author", "") or "匿名用户"
+
+            # 数据模型里目前没有的字段留空，导出后可手工填写
+            reply_text = comment.get("reply_text", "") or ""
+            reply_time = comment.get("reply_time", "") or ""
+            status = comment.get("status", "") or "待回复"
+            note = comment.get("note", "") or ""
+
+            ws.cell(row=row_idx, column=1, value=issue_code)
+            ws.cell(row=row_idx, column=2, value=sheet_label)
+            ws.cell(row=row_idx, column=3, value=problem_val)
+            # column=4 图片附件，稍后嵌入
+            ws.cell(row=row_idx, column=5, value=suggestion_val)
+            ws.cell(row=row_idx, column=6, value=reply_text)
+            ws.cell(row=row_idx, column=7, value=reply_time)
+            ws.cell(row=row_idx, column=8, value=author)
+            ws.cell(row=row_idx, column=9, value=status)
+            ws.cell(row=row_idx, column=10, value=note if note else f"批注时间：{time_str}")
+
+            # 行高足够放下缩略图；Excel 单位 pt ≈ 1.333 px
+            ws.row_dimensions[row_idx].height = 140
+
+            # 嵌入图片附件到 D 列（原图分辨率，Excel 显示时按 xl_img.width/height 等比缩放）
+            attachment_path = _attachment_for(page_num, comment)
+            if attachment_path is not None and attachment_path.exists():
+                try:
+                    xl_img = XLImage(str(attachment_path))
+                    # 保持原图长宽比，按行高缩放到显示尺寸；文件里图片仍是原分辨率
+                    display_h = 180
+                    with Image.open(attachment_path) as _probe:
+                        w_px, h_px = _probe.size
+                    display_w = max(80, int(round(w_px / max(1, h_px) * display_h)))
+                    display_w = min(display_w, 260)  # 单元格宽度上限（D 列 24 ≈ 168px 起）
+                    xl_img.width = display_w
+                    xl_img.height = display_h
+                    xl_img.anchor = f"D{row_idx}"
+                    ws.add_image(xl_img)
+                except Exception:
+                    # 图片嵌入失败退化为文件名
+                    ws.cell(row=row_idx, column=4, value=attachment_path.name)
+
+            # 自动换行 + 顶部对齐（问题/建议/回复/备注 各列）
+            for col in (2, 3, 5, 6, 10):
+                ws.cell(row=row_idx, column=col).alignment = Alignment(
+                    wrap_text=True, vertical="top",
+                )
+            for col in (1, 7, 8, 9):
+                ws.cell(row=row_idx, column=col).alignment = Alignment(
+                    horizontal="center", vertical="center",
+                )
+
+            row_idx += 1
+
+    if row_idx == 2:
+        # 表头之外没有数据
         return None
 
-    from io import BytesIO
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "人工批注"
-    headers = ["页码", "序号", "批注人", "批注内容", "时间"]
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-    for row in rows:
-        ws.append(row)
-
-    widths = [8, 8, 16, 60, 20]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[chr(64 + i)].width = w
-    for row_cells in ws.iter_rows(min_row=2):
-        row_cells[3].alignment = Alignment(wrap_text=True, vertical="top")
+    # 冻结首行
+    ws.freeze_panes = "A2"
 
     buffer = BytesIO()
     wb.save(buffer)
@@ -1840,6 +2547,26 @@ def _render_document_result(doc: Document):
             st.json(analysis_data)
 
 
+def _format_duration_seconds(seconds: float | int | None) -> str:
+    """把秒数格式化为易读时长（如 3.4 秒 / 1 分 12 秒 / 1 小时 03 分）。"""
+    if seconds is None:
+        return ""
+    try:
+        secs = float(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if secs < 0:
+        return ""
+    if secs < 60:
+        return f"{secs:.1f} 秒"
+    if secs < 3600:
+        m, s = divmod(int(round(secs)), 60)
+        return f"{m} 分 {s:02d} 秒"
+    h, rem = divmod(int(round(secs)), 3600)
+    m = rem // 60
+    return f"{h} 小时 {m:02d} 分"
+
+
 def _save_doc_analysis_result(doc_id: int, answer: str, data: dict):
     """保存图纸分析结果到 Document 分析字段."""
     with session() as s:
@@ -1910,6 +2637,7 @@ def _run_drawing_ai_job(
     extra_data: dict | None = None,
 ) -> dict:
     """预处理图纸并调用视觉AI，返回会话结果."""
+    t_start = time.perf_counter()
     with session() as s:
         doc_db = s.query(Document).filter(Document.id == doc.id).first()
         if doc_db:
@@ -1917,11 +2645,14 @@ def _run_drawing_ai_job(
             doc_db.analysis_error = None
             s.commit()
 
+    t_pre_start = time.perf_counter()
     image_paths, error = _prepare_drawing_images(doc, project.id)
+    preprocess_seconds = time.perf_counter() - t_pre_start
     if error:
         _mark_doc_failed(doc.id, error)
         return {"error": error}
 
+    t_ai_start = time.perf_counter()
     result = vision_chat(
         query=prompt,
         image_paths=[str(p) for p in image_paths],
@@ -1931,10 +2662,12 @@ def _run_drawing_ai_job(
         provider=provider,
         title=title,
     )
+    ai_seconds = time.perf_counter() - t_ai_start
     if result.get("error"):
         _mark_doc_failed(doc.id, result["error"])
         return result
 
+    total_seconds = time.perf_counter() - t_start
     analysis_data = {
         "job_kind": job_kind,
         "provider": provider,
@@ -1943,12 +2676,22 @@ def _run_drawing_ai_job(
         "preprocessed_images": [str(p) for p in image_paths],
         "chat_session_id": result["session_id"],
         "chat_message_id": result.get("message_id"),
+        "duration_seconds": round(total_seconds, 2),
+        "duration_breakdown": {
+            "preprocess_seconds": round(preprocess_seconds, 2),
+            "ai_seconds": round(ai_seconds, 2),
+        },
     }
     if extra_data:
         analysis_data.update(extra_data)
 
     _save_doc_analysis_result(doc.id, result["answer"] or "", analysis_data)
-    return {**result, "image_count": len(image_paths), "analysis_data": analysis_data}
+    return {
+        **result,
+        "image_count": len(image_paths),
+        "analysis_data": analysis_data,
+        "duration_seconds": total_seconds,
+    }
 
 
 def _run_review_triage(image_paths: list[Path], doc: Document, provider: str) -> tuple[str, dict]:
@@ -2019,6 +2762,7 @@ def _retrieve_review_context(project: Project, doc: Document, provider: str,
 def _run_drawing_review_rag(project: Project, doc: Document, provider: str,
                             custom_prompt: str) -> dict:
     """图纸审核（RAG）：预处理 -> 分诊检索 -> 审核，并保存结果."""
+    t_start = time.perf_counter()
     with session() as s:
         doc_db = s.query(Document).filter(Document.id == doc.id).first()
         if doc_db:
@@ -2026,14 +2770,19 @@ def _run_drawing_review_rag(project: Project, doc: Document, provider: str,
             doc_db.analysis_error = None
             s.commit()
 
+    t_pre_start = time.perf_counter()
     image_paths, error = _prepare_drawing_images(doc, project.id)
+    preprocess_seconds = time.perf_counter() - t_pre_start
     if error:
         _mark_doc_failed(doc.id, error)
         return {"error": error}
 
+    t_rag_start = time.perf_counter()
     ctx = _retrieve_review_context(project, doc, provider, image_paths, custom_prompt)
+    rag_seconds = time.perf_counter() - t_rag_start
     prompt = _format_review_prompt(doc, ctx["rules"], ctx["cases"], custom_prompt)
 
+    t_ai_start = time.perf_counter()
     result = vision_chat(
         query=prompt,
         image_paths=[str(p) for p in image_paths],
@@ -2043,9 +2792,18 @@ def _run_drawing_review_rag(project: Project, doc: Document, provider: str,
         provider=provider,
         title=f"{REVIEW_SESSION_PREFIX}{doc.filename}",
     )
+    ai_seconds = time.perf_counter() - t_ai_start
     if result.get("error"):
         _mark_doc_failed(doc.id, result["error"])
         return result
+
+    total_seconds = time.perf_counter() - t_start
+
+    # 提取页面名称（图名+图号），失败不阻断审核结果
+    try:
+        page_labels = _ensure_page_labels(doc, project.id, image_paths, use_vision=True, provider=provider)
+    except Exception:
+        page_labels = []
 
     analysis_data = {
         "job_kind": "drawing_review",
@@ -2061,6 +2819,13 @@ def _run_drawing_review_rag(project: Project, doc: Document, provider: str,
         "rag_rules_count": len(ctx["rules"]),
         "rag_cases_count": len(ctx["cases"]),
         "rag_fallback_all_rules": ctx["fallback_all_rules"],
+        "page_labels": page_labels,
+        "duration_seconds": round(total_seconds, 2),
+        "duration_breakdown": {
+            "preprocess_seconds": round(preprocess_seconds, 2),
+            "rag_retrieval_seconds": round(rag_seconds, 2),
+            "ai_seconds": round(ai_seconds, 2),
+        },
     }
 
     _save_doc_analysis_result(doc.id, result["answer"] or "", analysis_data)
@@ -2070,6 +2835,7 @@ def _run_drawing_review_rag(project: Project, doc: Document, provider: str,
         "analysis_data": analysis_data,
         "rules_count": len(ctx["rules"]),
         "cases_count": len(ctx["cases"]),
+        "duration_seconds": total_seconds,
     }
 
 
@@ -2147,6 +2913,10 @@ def view_drawing_analysis_history(project: Project):
                 st.markdown(f"**分析状态:** {status_text}")
                 if doc.analyzed_at:
                     st.markdown(f"**分析时间:** {format_beijing(doc.analyzed_at, '%Y-%m-%d %H:%M:%S')}")
+                _analysis_data = _parse_analysis_data(doc)
+                _duration_txt = _format_duration_seconds(_analysis_data.get("duration_seconds"))
+                if _duration_txt:
+                    st.markdown(f"**AI 用时:** {_duration_txt}")
 
             with col_b:
                 _display_preview(project.id, doc, width=200)
@@ -2234,7 +3004,14 @@ def view_new_drawing_analysis(project: Project):
             with st.spinner("正在保存图纸文件..."):
                 doc_id = _save_uploaded_drawing(project.id, uploaded_file)
             st.session_state["drawing_uploaded_selected_doc_id"] = doc_id
-            st.success("图纸已上传并选择。")
+            with st.spinner("正在预处理并自动提取页面名称（图名+图号）..."):
+                named, err = _extract_labels_after_upload(project.id, doc_id)
+            if err:
+                st.warning(f"页面名称自动提取失败：{err}（可在审核时手动重跑）")
+            elif named:
+                st.success(f"图纸已上传并选择；已自动识别 {named} 页图名/图号。")
+            else:
+                st.info("图纸已上传并选择；未识别到明显的图名/图号，可稍后手动重跑。")
 
         selected_doc_id = st.session_state.get("drawing_uploaded_selected_doc_id")
         if selected_doc_id:
@@ -2305,8 +3082,10 @@ def view_new_drawing_analysis(project: Project):
                 st.stop()
 
             st.session_state["drawing_analysis_session_id"] = result["session_id"]
+            duration_txt = _format_duration_seconds(result.get("duration_seconds"))
+            duration_msg = f"，用时 {duration_txt}" if duration_txt else ""
             st.success(
-                f"图纸分析完成，共生成/使用 {result.get('image_count', 0)} 张图片；"
+                f"图纸分析完成{duration_msg}，共生成/使用 {result.get('image_count', 0)} 张图片；"
                 "结果已保存，并已创建可继续追问的问答会话。"
             )
             st.rerun()
@@ -2330,8 +3109,10 @@ def view_new_drawing_analysis(project: Project):
                 st.stop()
 
             st.session_state["drawing_analysis_session_id"] = result["session_id"]
+            duration_txt = _format_duration_seconds(result.get("duration_seconds"))
+            duration_msg = f"，用时 {duration_txt}" if duration_txt else ""
             st.success(
-                f"图纸审核完成，共生成/使用 {result.get('image_count', 0)} 张图片；"
+                f"图纸审核完成{duration_msg}，共生成/使用 {result.get('image_count', 0)} 张图片；"
                 f"RAG 检索出 {result.get('rules_count', 0)} 条相关规则、"
                 f"{result.get('cases_count', 0)} 条人工案例，结果已保存为可继续追问的会话。"
             )
