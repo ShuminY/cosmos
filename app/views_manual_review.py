@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -39,6 +40,11 @@ from views_drawings import (
     _ensure_page_labels,
     _load_page_labels,
     _format_page_label,
+    CANVAS_AVAILABLE,
+    st_canvas,
+    _canvas_display_size,
+    _bbox_to_canvas_rect,
+    _normalize_manual_bbox,
 )
 
 
@@ -252,28 +258,155 @@ def _render_manual_review_workbench(doc: Document, project: Project):
 
     page_title = f"第 {page_number} 页{page_label}" if page_label else f"第 {page_number} 页"
 
-    col_image, col_comments = st.columns([6, 3])
-    with col_image:
-        st.caption(f"{page_title} / 共 {total_pages} 页")
-        _render_full_resolution_image(
-            current_image,
-            f"{page_title}图纸",
-            key=f"manual_review_image_{doc.id}_{selected_index}",
-        )
-        st.download_button(
-            label="🖼️ 下载当前页图纸 PNG",
-            data=current_image.read_bytes(),
-            file_name=f"{Path(doc.filename).stem}_第{page_number:03d}页.png",
-            mime="image/png",
-            key=f"download_manual_page_{doc.id}_{selected_index}",
-        )
+    # 标注模式状态和已选位置
+    annotate_mode_key = f"annotate_mode_{doc.id}_{page_number}"
+    annotate_mode = st.session_state.get(annotate_mode_key, False)
+    manual_bbox_key = f"manual_bbox_{doc.id}_{page_number}"
+    manual_bbox_norm = st.session_state.get(manual_bbox_key, None)
 
-    with col_comments:
-        # 复用图纸分析里的批注 UI（增删改一致），并支持在图上拖拽画框选定位置
-        _render_manual_comments_ui(
-            fresh_doc or doc, page_number, page_comments,
-            page_image_path=current_image,
-        )
+    # 检查是否有人工批注需要定位
+    manual_focus_key = f"manual_focus_{doc.id}_{page_number}"
+    manual_focus_comment_id = st.session_state.get(manual_focus_key)
+    manual_focus_bbox = None
+    if manual_focus_comment_id is not None:
+        for comment in page_comments:
+            if comment.get("id") == manual_focus_comment_id:
+                bbox = comment.get("bbox")
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    manual_focus_bbox = tuple(float(v) for v in bbox[:4])
+                    break
+        if not manual_focus_bbox:
+            # 找不到批注或bbox无效时清除
+            st.session_state.pop(manual_focus_key, None)
+            manual_focus_comment_id = None
+
+    if CANVAS_AVAILABLE and annotate_mode:
+        # ===== 标注模式：左侧 canvas + 右侧人工批注，批注栏保持在右侧不被挤到下方 =====
+        col_canvas, col_comments = st.columns([7, 3])
+        with col_canvas:
+            st.caption(f"{page_title} / 共 {total_pages} 页")
+            col_exit, col_hint = st.columns([1, 4])
+            with col_exit:
+                if st.button("❌ 退出标注", key=f"cancel_annotate_{doc.id}_{page_number}"):
+                    st.session_state[annotate_mode_key] = False
+                    st.rerun()
+            with col_hint:
+                st.caption("🔴 标注模式：在下方图上按住鼠标**拖拽画一个矩形**来框选问题位置（绿色框为历史批注）。")
+
+            resized_bg = None
+            canvas_w, canvas_h = 0, 0
+            try:
+                if not current_image.exists():
+                    st.error("⚠️ 图片文件不存在，无法进行位置标注。")
+                else:
+                    with Image.open(current_image) as bg:
+                        bg = bg.convert("RGB")
+                        orig_w, orig_h = bg.size
+                        # 宽度适配左栏（约占 70% 屏宽），保持宽高比
+                        canvas_w, canvas_h = _canvas_display_size(orig_w, orig_h, max_width=1000, max_height=850)
+                        resized_bg = bg.resize((canvas_w, canvas_h))
+            except Exception as e:
+                st.error(f"加载图片失败：{str(e)}")
+                canvas_w, canvas_h = 0, 0
+
+            if canvas_w > 0 and resized_bg is not None:
+                existing_rects = []
+                for c in page_comments:
+                    b = c.get("bbox")
+                    if isinstance(b, (list, tuple)) and len(b) == 4:
+                        existing_rects.append(_bbox_to_canvas_rect(b, canvas_w, canvas_h, stroke_color="#22c55e"))
+
+                canvas_result = st_canvas(
+                    fill_color="rgba(239, 68, 68, 0.12)",
+                    stroke_width=2,
+                    stroke_color="#ef4444",
+                    background_image=resized_bg,
+                    update_streamlit=True,
+                    height=canvas_h,
+                    width=canvas_w,
+                    drawing_mode="rect",
+                    display_toolbar=True,
+                    initial_drawing={"version": "4.4.0", "objects": existing_rects} if existing_rects else None,
+                    key=f"canvas_{doc.id}_{page_number}_large",
+                )
+
+                # 保存选定位置
+                if canvas_result is not None and canvas_result.json_data is not None:
+                    new_rects = [
+                        obj for obj in canvas_result.json_data.get("objects", [])
+                        if obj.get("type") == "rect" and obj.get("selectable", True)
+                    ]
+                    if new_rects:
+                        last = new_rects[-1]
+                        left = float(last.get("left", 0))
+                        top = float(last.get("top", 0))
+                        w = float(last.get("width", 0)) * float(last.get("scaleX", 1) or 1)
+                        h = float(last.get("height", 0)) * float(last.get("scaleY", 1) or 1)
+                        if w > 0 and h > 0:
+                            x1 = left / canvas_w
+                            y1 = top / canvas_h
+                            x2 = (left + w) / canvas_w
+                            y2 = (top + h) / canvas_h
+                            manual_bbox_norm = _normalize_manual_bbox((x1, y1, x2, y2))
+                            st.session_state[manual_bbox_key] = manual_bbox_norm
+
+                col_sel, col_clear = st.columns([3, 1])
+                with col_sel:
+                    if manual_bbox_norm:
+                        st.caption(
+                            f"✅ 已选定标注位置：({manual_bbox_norm[0]*100:.0f}%, {manual_bbox_norm[1]*100:.0f}%) → "
+                            f"({manual_bbox_norm[2]*100:.0f}%, {manual_bbox_norm[3]*100:.0f}%)"
+                        )
+                with col_clear:
+                    if manual_bbox_norm:
+                        if st.button("🗑️ 清除位置", key=f"clear_bbox_{doc.id}_{page_number}", use_container_width=True):
+                            st.session_state.pop(manual_bbox_key, None)
+                            manual_bbox_norm = None
+                            st.rerun()
+
+        with col_comments:
+            # 批注栏保持在右侧
+            _render_manual_comments_ui(
+                fresh_doc or doc, page_number, page_comments,
+                page_image_path=current_image,
+                manual_bbox_norm=manual_bbox_norm,
+            )
+    else:
+        # ===== 普通模式：左图右批注两栏布局 =====
+        col_image, col_comments = st.columns([6, 3])
+        with col_image:
+            st.caption(f"{page_title} / 共 {total_pages} 页")
+
+            if not CANVAS_AVAILABLE:
+                st.caption("❌ `streamlit-drawable-canvas` 未安装，请先执行：`pip install streamlit-drawable-canvas`")
+
+            if manual_focus_bbox:
+                st.caption(f"🔍 已定位到人工批注位置，图片自动放大居中；点查看器内“复位”可看整页。")
+
+            # key 随所选问题变化，确保 iframe 重新挂载并执行定位脚本
+            focus_suffix = f"_{manual_focus_comment_id}" if manual_focus_comment_id else ""
+            viewer_key = f"manual_review_image_{doc.id}_{selected_index}{focus_suffix}"
+            _render_full_resolution_image(
+                current_image,
+                f"{page_title}图纸",
+                key=viewer_key,
+                focus_bbox=manual_focus_bbox,
+            )
+            st.download_button(
+                label="🖼️ 下载当前页图纸 PNG",
+                data=current_image.read_bytes(),
+                file_name=f"{Path(doc.filename).stem}_第{page_number:03d}页.png",
+                mime="image/png",
+                key=f"download_manual_page_{doc.id}_{selected_index}",
+            )
+
+        with col_comments:
+            # 复用图纸分析里的批注 UI（增删改一致），并支持在图上拖拽画框选定位置
+            _render_manual_comments_ui(
+                fresh_doc or doc, page_number, page_comments,
+                page_image_path=current_image,
+                manual_bbox_norm=manual_bbox_norm,
+            )
 
 
 def view_new_manual_review(project: Project):

@@ -1700,15 +1700,54 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
         # 所选问题无坐标或状态失效时清除，避免残留
         focus_idx = None
 
+    # 检查是否有人工批注需要定位
+    manual_focus_key = f"manual_focus_{doc.id}_{page_number}"
+    manual_focus_comment_id = st.session_state.get(manual_focus_key)
+    manual_focus_bbox = None
+    if manual_focus_comment_id is not None:
+        for comment in page_comments:
+            if comment.get("id") == manual_focus_comment_id:
+                bbox = comment.get("bbox")
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    manual_focus_bbox = tuple(float(v) for v in bbox[:4])
+                    break
+        if not manual_focus_bbox:
+            # 找不到批注或bbox无效时清除
+            st.session_state.pop(manual_focus_key, None)
+            manual_focus_comment_id = None
+
+    # 最终用于定位的 bbox：优先人工批注，其次系统审核问题
+    final_focus_bbox = manual_focus_bbox or focus_bbox
+
+    # 人工批注位置选择：存储当前页选定的 bbox 到 session_state
+    manual_bbox_key = f"manual_bbox_{doc.id}_{page_number}"
+    manual_bbox_norm = st.session_state.get(manual_bbox_key, None)
+
     with col_image:
         if marked_count:
             st.caption(f"已在图上标注 {marked_count} 处问题位置（编号与右侧系统审核一致，颜色对应严重程度；坐标由 AI 估算，仅供参考）。")
         else:
             st.caption("本页问题暂无可用于图上定位的坐标，显示原始页图。")
-        if focus_bbox:
+        if manual_focus_bbox:
+            st.caption(f"🔍 已定位到人工批注位置，图片自动放大居中；点查看器内“复位”可看整页。")
+        elif focus_bbox:
             st.caption(f"🔍 已定位到问题 {focus_idx}，图片自动放大居中；点查看器内“复位”可看整页。")
+
+        # 标注模式状态
+        annotate_mode_key = f"annotate_mode_{doc.id}_{page_number}"
+        annotate_mode = st.session_state.get(annotate_mode_key, False)
+
+        # 标注模式下的退出按钮
+        if CANVAS_AVAILABLE and annotate_mode:
+            if st.button("❌ 退出标注", key=f"cancel_annotate_{doc.id}_{page_number}"):
+                st.session_state[annotate_mode_key] = False
+                st.rerun()
+        elif not CANVAS_AVAILABLE:
+            st.caption("❌ `streamlit-drawable-canvas` 未安装，请先执行：`pip install streamlit-drawable-canvas`")
+
         # key 随所选问题变化，确保 iframe 重新挂载并执行定位脚本
-        viewer_key = f"review_legend_image_{doc.id}_{selected_index}_focus{focus_idx or 0}"
+        focus_suffix = f"{focus_idx or 0}_{manual_focus_comment_id or ''}"
+        viewer_key = f"review_legend_image_{doc.id}_{selected_index}_focus{focus_suffix}"
         caption_title = f"第 {page_number} 页图纸"
         if page_label_suffix:
             caption_title = f"第 {page_number} 页 {page_label_suffix}"
@@ -1716,7 +1755,7 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
             display_image,
             caption_title,
             key=viewer_key,
-            focus_bbox=focus_bbox,
+            focus_bbox=final_focus_bbox,
         )
         st.download_button(
             label="🖼️ 下载当前页标注图 PNG" if marked_count else "🖼️ 下载当前页图纸 PNG",
@@ -1726,6 +1765,96 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
             key=f"download_review_legend_{doc.id}_{selected_index}",
         )
 
+        # 如果在标注模式，才在下方显示标注画布
+        if CANVAS_AVAILABLE and annotate_mode:
+            st.divider()
+            st.subheader("✏️ 标注问题位置")
+            # 使用更大的画布尺寸适配左侧宽栏
+            resized_bg = None
+            canvas_w, canvas_h = 0, 0
+            try:
+                if not current_image.exists():
+                    st.error("⚠️ 图片文件不存在，无法进行位置标注。")
+                else:
+                    with Image.open(current_image) as bg:
+                        bg = bg.convert("RGB")
+                        orig_w, orig_h = bg.size
+                        # 左侧比较宽，使用更大的 max_width
+                        canvas_w, canvas_h = _canvas_display_size(orig_w, orig_h, max_width=720, max_height=720)
+                        # 提前 resize，保持图片在 with 块内处理
+                        resized_bg = bg.resize((canvas_w, canvas_h))
+            except Exception as e:
+                st.error(f"加载图片失败：{str(e)}")
+                canvas_w, canvas_h = 0, 0
+
+            if canvas_w > 0 and resized_bg is not None:
+                # 把当前页已有的人工批注框作为绿色只读矩形叠在背景上
+                existing_rects = []
+                for c in page_comments:
+                    b = c.get("bbox")
+                    if isinstance(b, (list, tuple)) and len(b) == 4:
+                        existing_rects.append(_bbox_to_canvas_rect(b, canvas_w, canvas_h, stroke_color="#22c55e"))
+
+                st.caption("在下方图上按住鼠标**拖拽画一个矩形**来框选问题位置（已有的绿色框为历史批注）。画好后位置会自动保存，到右侧填写批注内容即可。")
+                canvas_result = st_canvas(
+                    fill_color="rgba(239, 68, 68, 0.12)",
+                    stroke_width=2,
+                    stroke_color="#ef4444",
+                    background_image=resized_bg,
+                    update_streamlit=True,
+                    height=canvas_h,
+                    width=canvas_w,
+                    drawing_mode="rect",
+                    display_toolbar=True,
+                    initial_drawing={"version": "4.4.0", "objects": existing_rects} if existing_rects else None,
+                    key=f"canvas_{doc.id}_{page_number}_large",
+                )
+
+                # 取最后一个由用户新画的矩形，保存到 session_state
+                if canvas_result is not None and canvas_result.json_data is not None:
+                    new_rects = [
+                        obj for obj in canvas_result.json_data.get("objects", [])
+                        if obj.get("type") == "rect" and obj.get("selectable", True)
+                    ]
+                    if new_rects:
+                        last = new_rects[-1]
+                        left = float(last.get("left", 0))
+                        top = float(last.get("top", 0))
+                        w = float(last.get("width", 0)) * float(last.get("scaleX", 1) or 1)
+                        h = float(last.get("height", 0)) * float(last.get("scaleY", 1) or 1)
+                        if w > 0 and h > 0:
+                            x1 = left / canvas_w
+                            y1 = top / canvas_h
+                            x2 = (left + w) / canvas_w
+                            y2 = (top + h) / canvas_h
+                            manual_bbox_norm = _normalize_manual_bbox((x1, y1, x2, y2))
+                            st.session_state[manual_bbox_key] = manual_bbox_norm
+
+                # 显示当前已选定位置
+                if manual_bbox_norm:
+                    st.caption(
+                        f"✅ 已选定标注位置：({manual_bbox_norm[0]*100:.0f}%, {manual_bbox_norm[1]*100:.0f}%) → "
+                        f"({manual_bbox_norm[2]*100:.0f}%, {manual_bbox_norm[3]*100:.0f}%)"
+                    )
+
+                # 取消和清除按钮
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("❌ 取消标注", key=f"cancel_annotate_{doc.id}_{page_number}", use_container_width=True):
+                        st.session_state[annotate_mode_key] = False
+                        st.rerun()
+                with col2:
+                    if manual_bbox_norm:
+                        if st.button("🗑️ 清除位置", key=f"clear_bbox_{doc.id}_{page_number}", use_container_width=True):
+                            st.session_state.pop(manual_bbox_key, None)
+                            manual_bbox_norm = None
+                            st.rerun()
+            elif annotate_mode:
+                # 加载失败，显示取消按钮
+                if st.button("❌ 取消标注", key=f"cancel_annotate_fail_{doc.id}_{page_number}", use_container_width=True):
+                    st.session_state[annotate_mode_key] = False
+                    st.rerun()
+
     with col_review:
         _render_page_review_items(doc, page_number, current_page_items,
                                   page_label_suffix=page_label_suffix)
@@ -1733,7 +1862,8 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
     with col_comments:
         _render_manual_comments_ui(doc, page_number, page_comments,
                                    page_image_path=current_image,
-                                   page_label_suffix=page_label_suffix)
+                                   page_label_suffix=page_label_suffix,
+                                   manual_bbox_norm=manual_bbox_norm)
 
 
 def _review_item_confirm_text(item: dict) -> str:
@@ -1836,11 +1966,13 @@ def _estimate_text_area_height(text: str) -> int:
 
 def _render_manual_comments_ui(doc: Document, page_number: int, page_comments: list[dict],
                                page_image_path: Path | None = None,
-                               page_label_suffix: str = ""):
+                               page_label_suffix: str = "",
+                               manual_bbox_norm: tuple[float, float, float, float] | None = None):
     """当前页人工批注的增删改界面（显示在图片右侧）。
 
     page_image_path: 当前页 PNG 路径；提供后新增批注支持在图上拖拽画框选定位置。
     page_label_suffix: 图名+图号后缀（例如 "A户型平面图 P00"），有则拼在标题里。
+    manual_bbox_norm: 左侧大图上已选定的归一化 bbox（由左侧画布标注提供）。
     """
     header = f"第 {page_number} 页"
     if page_label_suffix:
@@ -1848,82 +1980,135 @@ def _render_manual_comments_ui(doc: Document, page_number: int, page_comments: l
     st.markdown(f"#### 📝 {header} · 人工批注")
     st.caption("批注保存到本审核结果中，按页码记录。")
 
+    # 新增批注区域放在列表上方，带边框
+    with st.container(border=True):
+        _render_add_manual_comment(doc, page_number, page_comments, page_image_path, manual_bbox_norm)
+
     if page_comments:
-        for idx, comment in enumerate(page_comments, start=1):
-            comment_id = comment.get("id", "")
-            author = comment.get("author", "") or "匿名用户"
-            created_at = comment.get("created_at", "")
-            time_str = ""
-            if created_at:
-                try:
-                    time_str = format_beijing(datetime.fromisoformat(created_at), "%Y-%m-%d %H:%M")
-                except Exception:
-                    time_str = ""
-            edit_key = f"edit_comment_{doc.id}_{page_number}_{comment_id}"
-            problem_val, suggestion_val = _comment_display_parts(comment)
-            with st.container(border=True):
-                st.markdown(f"**{idx}. {author}**" + (f" · {time_str}" if time_str else ""))
-                if st.session_state.get(edit_key, False):
-                    new_problem = st.text_area(
-                        "问题描述",
-                        value=problem_val,
-                        key=f"edit_problem_{doc.id}_{page_number}_{comment_id}",
-                        height=_estimate_text_area_height(problem_val),
-                    )
-                    new_suggestion = st.text_area(
-                        "建议方案",
-                        value=suggestion_val,
-                        key=f"edit_suggestion_{doc.id}_{page_number}_{comment_id}",
-                        height=_estimate_text_area_height(suggestion_val),
-                    )
-                    c1, c2 = st.columns(2)
-                    if c1.button("保存", key=f"save_{doc.id}_{page_number}_{comment_id}", type="primary"):
-                        if not (new_problem.strip() or new_suggestion.strip()):
-                            st.warning("请至少填写“问题描述”或“建议方案”其中之一。")
-                        else:
-                            _update_manual_comment(
-                                doc.id, page_number, comment_id,
-                                problem=new_problem, suggestion=new_suggestion,
-                            )
+        st.markdown("**📋 已有批注**")
+        # 固定高度容器，批注过多时内部上下滚动，避免页面被拉得过长
+        with st.container(height=450):
+            for idx, comment in enumerate(page_comments, start=1):
+                comment_id = comment.get("id", "")
+                author = comment.get("author", "") or "匿名用户"
+                created_at = comment.get("created_at", "")
+                time_str = ""
+                if created_at:
+                    try:
+                        time_str = format_beijing(datetime.fromisoformat(created_at), "%Y-%m-%d %H:%M")
+                    except Exception:
+                        time_str = ""
+                edit_key = f"edit_comment_{doc.id}_{page_number}_{comment_id}"
+                problem_val, suggestion_val = _comment_display_parts(comment)
+                with st.container(border=True):
+                    st.markdown(f"**{idx}. {author}**" + (f" · {time_str}" if time_str else ""))
+                    if st.session_state.get(edit_key, False):
+                        new_problem = st.text_area(
+                            "问题描述",
+                            value=problem_val,
+                            key=f"edit_problem_{doc.id}_{page_number}_{comment_id}",
+                            height=_estimate_text_area_height(problem_val),
+                        )
+                        new_suggestion = st.text_area(
+                            "建议方案",
+                            value=suggestion_val,
+                            key=f"edit_suggestion_{doc.id}_{page_number}_{comment_id}",
+                            height=_estimate_text_area_height(suggestion_val),
+                        )
+                        c1, c2 = st.columns(2)
+                        if c1.button("保存", key=f"save_{doc.id}_{page_number}_{comment_id}", type="primary"):
+                            if not (new_problem.strip() or new_suggestion.strip()):
+                                st.warning("请至少填写“问题描述”或“建议方案”其中之一。")
+                            else:
+                                _update_manual_comment(
+                                    doc.id, page_number, comment_id,
+                                    problem=new_problem, suggestion=new_suggestion,
+                                )
+                                st.session_state[edit_key] = False
+                                st.rerun()
+                        if c2.button("取消", key=f"cancel_{doc.id}_{page_number}_{comment_id}"):
                             st.session_state[edit_key] = False
                             st.rerun()
-                    if c2.button("取消", key=f"cancel_{doc.id}_{page_number}_{comment_id}"):
-                        st.session_state[edit_key] = False
-                        st.rerun()
-                else:
-                    if problem_val:
-                        st.markdown(f"**问题描述：** {problem_val}")
-                    if suggestion_val:
-                        st.markdown(f"**建议方案：** {suggestion_val}")
-                    if not problem_val and not suggestion_val:
-                        # 极端兜底：两段都为空但历史 text 也为空的行
-                        st.markdown(comment.get("text", ""))
-                    bbox = comment.get("bbox")
-                    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-                        st.caption(
-                            "📍 已标注图上位置："
-                            f"({bbox[0]*100:.0f}%, {bbox[1]*100:.0f}%) → "
-                            f"({bbox[2]*100:.0f}%, {bbox[3]*100:.0f}%)"
-                        )
-                    c1, c2 = st.columns(2)
-                    if c1.button("✏️ 编辑", key=f"editbtn_{doc.id}_{page_number}_{comment_id}"):
-                        st.session_state[edit_key] = True
-                        st.rerun()
-                    if c2.button("🗑️ 删除", key=f"del_{doc.id}_{page_number}_{comment_id}"):
-                        _delete_manual_comment(doc.id, page_number, comment_id)
-                        st.rerun()
+                    else:
+                        if problem_val:
+                            st.markdown(f"**问题描述：** {problem_val}")
+                        if suggestion_val:
+                            st.markdown(f"**建议方案：** {suggestion_val}")
+                        if not problem_val and not suggestion_val:
+                            # 极端兜底：两段都为空但历史 text 也为空的行
+                            st.markdown(comment.get("text", ""))
+                        bbox = comment.get("bbox")
+                        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                            st.caption(
+                                "📍 已标注图上位置："
+                                f"({bbox[0]*100:.0f}%, {bbox[1]*100:.0f}%) → "
+                                f"({bbox[2]*100:.0f}%, {bbox[3]*100:.0f}%)"
+                            )
+                        # 按钮行：根据是否有 bbox 调整列分布
+                        if bbox is not None:
+                            c1, c2, c3 = st.columns([1, 1, 1])
+                            if c1.button("✏️ 编辑", key=f"editbtn_{doc.id}_{page_number}_{comment_id}"):
+                                st.session_state[edit_key] = True
+                                st.rerun()
+                            if c2.button("🗑️ 删除", key=f"del_{doc.id}_{page_number}_{comment_id}"):
+                                _delete_manual_comment(doc.id, page_number, comment_id)
+                                st.rerun()
+                            # 点击在图上显示标注位置按钮
+                            manual_focus_key = f"manual_focus_{doc.id}_{page_number}"
+                            current_focus = st.session_state.get(manual_focus_key)
+                            is_focused = current_focus == comment_id
+                            if c3.button("📍 查看位置" if not is_focused else "❌ 取消定位",
+                                       key=f"focus_{doc.id}_{page_number}_{comment_id}"):
+                                if is_focused:
+                                    st.session_state.pop(manual_focus_key, None)
+                                else:
+                                    st.session_state[manual_focus_key] = comment_id
+                                st.rerun()
+                        else:
+                            c1, c2 = st.columns(2)
+                            if c1.button("✏️ 编辑", key=f"editbtn_{doc.id}_{page_number}_{comment_id}"):
+                                st.session_state[edit_key] = True
+                                st.rerun()
+                            if c2.button("🗑️ 删除", key=f"del_{doc.id}_{page_number}_{comment_id}"):
+                                _delete_manual_comment(doc.id, page_number, comment_id)
+                                st.rerun()
     else:
         st.caption("本页暂无人工批注。")
 
-    _render_add_manual_comment(doc, page_number, page_comments, page_image_path)
-
 
 def _render_add_manual_comment(doc: Document, page_number: int, page_comments: list[dict],
-                               page_image_path: Path | None):
-    """新增批注：问题描述 + 建议方案 + 可选的“图上拖拽画框”定位。"""
-    st.markdown("**➕ 新增人工批注**")
-    # 画框选区放在 form 外面：canvas 是独立组件，需要每次交互就把结果回传。
-    bbox_norm = _render_manual_bbox_picker(doc, page_number, page_comments, page_image_path)
+                               page_image_path: Path | None,
+                               manual_bbox_norm: tuple[float, float, float, float] | None = None):
+    """新增批注：问题描述 + 建议方案 + 可选的“图上拖拽画框”定位。
+
+    标注位置现在改到左侧大图画布进行，这里只接收结果。
+    """
+    # 标题行：左侧标题，右侧标注位置按钮
+    annotate_mode_key = f"annotate_mode_{doc.id}_{page_number}"
+    annotate_mode = st.session_state.get(annotate_mode_key, False)
+    col_title, col_annotate = st.columns([3, 1.2])
+    with col_title:
+        st.markdown("**➕ 新增人工批注**")
+    with col_annotate:
+        if CANVAS_AVAILABLE:
+            if not annotate_mode:
+                if st.button("✏️ 标注位置", key=f"start_annotate_{doc.id}_{page_number}"):
+                    st.session_state[annotate_mode_key] = True
+                    st.rerun()
+            else:
+                if st.button("❌ 退出标注", key=f"exit_annotate_{doc.id}_{page_number}"):
+                    st.session_state[annotate_mode_key] = False
+                    st.rerun()
+
+    if not CANVAS_AVAILABLE:
+        st.caption("💡 提示：安装 `streamlit-drawable-canvas` 后可在左侧大图上拖拽画框选定批注位置。")
+    elif manual_bbox_norm:
+        st.caption(
+            f"📍 已在左侧大图标注位置：({manual_bbox_norm[0]*100:.0f}%, {manual_bbox_norm[1]*100:.0f}%) → "
+            f"({manual_bbox_norm[2]*100:.0f}%, {manual_bbox_norm[3]*100:.0f}%)"
+        )
+    else:
+        st.caption("💡 点击右侧「标注位置」后在大图上拖拽画框可标注问题位置（不需要标注位置时直接填写内容添加即可）。")
 
     # 用 form + clear_on_submit=True，提交成功后 Streamlit 自动清空表单内所有输入。
     form_key = f"new_comment_form_{doc.id}_{page_number}"
@@ -1949,8 +2134,12 @@ def _render_add_manual_comment(doc: Document, page_number: int, page_comments: l
         _add_manual_comment(
             doc.id, page_number, text="",
             problem=new_problem, suggestion=new_suggestion,
-            bbox=bbox_norm,
+            bbox=manual_bbox_norm,
         )
+        # 添加成功后清除已标注的 bbox，并自动退出标注模式
+        manual_bbox_key = f"manual_bbox_{doc.id}_{page_number}"
+        st.session_state.pop(manual_bbox_key, None)
+        st.session_state.pop(f"annotate_mode_{doc.id}_{page_number}", None)
         st.rerun()
 
 
@@ -2072,14 +2261,14 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
     st.iframe(
         f"""
 <div style="font-family:sans-serif;">
-  <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
+  <div style="display:flex; gap:8px; align-items:center; margin-top:4px; margin-bottom:8px; flex-wrap:wrap;">
     <button id="open-{safe_key}" style="padding:0.35rem 0.6rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">🔎 查看原图</button>
     <button id="zoomout-{safe_key}" style="padding:0.35rem 0.6rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">➖</button>
     <button id="zoomin-{safe_key}" style="padding:0.35rem 0.6rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">➕</button>
     <button id="reset-{safe_key}" style="padding:0.35rem 0.6rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">复位</button>
     <span id="pct-{safe_key}" style="color:#6b7280; font-size:0.9rem;">100%</span>
   </div>
-  <div id="frame-{safe_key}" style="border:1px solid #e5e7eb; border-radius:8px; background:#f9fafb; overflow:auto; max-height:640px; cursor:grab; position:relative;">
+  <div id="frame-{safe_key}" style="border:1px solid #e5e7eb; border-radius:8px; background:#f9fafb; overflow:auto; max-height:864px; cursor:grab; position:relative;">
     <img id="img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px;" />
   </div>
 </div>
@@ -2166,7 +2355,7 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
 }})();
 </script>
 """,
-        height=720,
+        height=972,
     )
 
 
