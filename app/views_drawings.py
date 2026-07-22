@@ -1655,10 +1655,11 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
                 "选择标注图页码",
                 range(total_pages),
                 format_func=_page_display,
+                index=current,
                 key=page_key,
             )
 
-    page_number = selected_index + 1
+    page_number = int(selected_index) + 1
     page_label_suffix = _format_page_label(page_labels, page_number)
     current_page_items, unknown_page_items = _split_review_items_for_page(review_items, page_number, total_pages)
     if total_pages > 1:
@@ -2297,9 +2298,30 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
     img.style.height = (baseH * scale) + 'px';
     pct.textContent = Math.round(scale * 100) + '%';
   }}
-  function zoom(factor) {{
-    scale = Math.min(8, Math.max(0.05, scale * factor));
+  function zoom(factor, centerX = null, centerY = null) {{
+    // 缩放时保持中心点不变
+    // centerX/centerY: 相对于视口的中心点坐标，如果为 null 则使用视口中心
+    const [fw, fh] = frameSize();
+    const oldScale = scale;
+    const newScale = Math.min(8, Math.max(0.05, scale * factor));
+    if (newScale === oldScale) return;
+
+    // 获取中心点在原图上的坐标（缩放前）
+    const cxImg = centerX !== null ? (frame.scrollLeft + centerX) : (frame.scrollLeft + fw / 2);
+    const cyImg = centerY !== null ? (frame.scrollTop + centerY) : (frame.scrollTop + fh / 2);
+
+    // 应用新缩放
+    scale = newScale;
     apply();
+
+    // 调整滚动位置，让同一点仍在原来的视口位置
+    const factorRatio = newScale / oldScale;
+    const newCxImg = cxImg * factorRatio;
+    const newCyImg = cyImg * factorRatio;
+    const newScrollLeft = centerX !== null ? (newCxImg - centerX) : (newCxImg - fw / 2);
+    const newScrollTop = centerY !== null ? (newCyImg - centerY) : (newCyImg - fh / 2);
+    frame.scrollLeft = Math.max(0, newScrollLeft);
+    frame.scrollTop = Math.max(0, newScrollTop);
   }}
   function focusOn() {{
     if (!focus) {{ fit(); return; }}
@@ -2324,7 +2346,11 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
   frame.addEventListener('wheel', function(e) {{
     if (!e.ctrlKey && !e.metaKey) return;
     e.preventDefault();
-    zoom(e.deltaY < 0 ? 1.1 : 0.9);
+    // 以鼠标位置为中心缩放
+    const rect = frame.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+    zoom(e.deltaY < 0 ? 1.1 : 0.9, mouseX, mouseY);
   }}, {{ passive: false }});
 
   // Drag to pan

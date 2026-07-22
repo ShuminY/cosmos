@@ -171,23 +171,38 @@ def _select_or_upload_doc(project: Project) -> Document | None:
     return None
 
 
-def _render_page_navigation(doc_id: int, total_pages: int, labels: list[dict] | None = None) -> int:
+def _render_page_navigation(doc_id: int, total_pages: int, labels: list[dict] | None = None,
+                            page_comment_counts: list[int] | None = None) -> int:
     """页面导航（选择框 + 上一页/下一页）。返回 0-based selected_index.
 
     labels 提供时，选择框会显示“第 N 页 图名图号”。
+    page_comment_counts 提供时，显示每页批注数量。
     """
     if total_pages <= 1:
         return 0
 
     labels = labels or []
+    page_comment_counts = page_comment_counts or []
     page_key = f"manual_review_page_{doc_id}"
     current = st.session_state.get(page_key, 0)
+    # 如果 Streamlit 保存了选项对象，提取 value
+    if isinstance(current, dict) and "value" in current:
+        current = int(current["value"])
     if not isinstance(current, int) or not (0 <= current < total_pages):
         current = 0
 
-    def _fmt(i: int) -> str:
+    # 提前构建所有选项标签，避免 format_func 闭包捕获变化导致 Streamlit 重置选择
+    options = []
+    for i in range(total_pages):
         suffix = _format_page_label(labels, i + 1)
-        return f"第 {i + 1} 页 {suffix}" if suffix else f"第 {i + 1} 页"
+        page_num = i + 1
+        count = page_comment_counts[i] if i < len(page_comment_counts) else 0
+        count_text = f"({count} 条批注)" if count > 0 else "(无批注)"
+        if suffix:
+            label = f"第 {page_num} 页 {suffix} · {count_text}"
+        else:
+            label = f"第 {page_num} 页 · {count_text}"
+        options.append({"value": i, "label": label})
 
     col_prev, col_select, col_next = st.columns([1, 4, 1])
     with col_prev:
@@ -201,13 +216,16 @@ def _render_page_navigation(doc_id: int, total_pages: int, labels: list[dict] | 
             st.session_state[page_key] = current + 1
             st.rerun()
     with col_select:
-        selected = st.selectbox(
+        selected_value = st.selectbox(
             "选择页码",
-            range(total_pages),
-            format_func=_fmt,
+            options=options,
+            format_func=lambda opt: opt["label"],
+            index=current,
             key=page_key,
         )
-    return selected
+        selected = selected_value["value"]
+    # 强制转换为 int，避免 Streamlit 返回非 int 类型导致下次验证失败被重置为 0
+    return int(selected)
 
 
 def _render_manual_review_workbench(doc: Document, project: Project):
@@ -245,15 +263,23 @@ def _render_manual_review_workbench(doc: Document, project: Project):
             st.success("页面名称已提取完成。")
             st.rerun()
 
-    selected_index = _render_page_navigation(doc.id, total_pages, labels=labels if has_labels else None)
-    page_number = selected_index + 1
-    current_image = image_paths[selected_index]
-    page_label = _format_page_label(labels, page_number) if has_labels else ""
-
     # 重新从 DB 读取最新的 analysis_data（含新增批注）
     with session() as s:
         fresh_doc = s.query(Document).filter(Document.id == doc.id).first()
     fresh_data = _parse_analysis_data(fresh_doc) if fresh_doc else {}
+
+    # 计算每页批注数量用于导航显示
+    page_comment_counts = []
+    all_manual_comments = fresh_data.get("manual_comments", {}) if fresh_data else {}
+    for p in range(1, total_pages + 1):
+        comments = _get_page_manual_comments(fresh_data, p)
+        page_comment_counts.append(len(comments))
+
+    selected_index = _render_page_navigation(doc.id, total_pages, labels=labels if has_labels else None,
+                                            page_comment_counts=page_comment_counts)
+    page_number = selected_index + 1
+    current_image = image_paths[selected_index]
+    page_label = _format_page_label(labels, page_number) if has_labels else ""
     page_comments = _get_page_manual_comments(fresh_data, page_number)
 
     page_title = f"第 {page_number} 页{page_label}" if page_label else f"第 {page_number} 页"
