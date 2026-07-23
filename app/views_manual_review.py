@@ -35,6 +35,10 @@ from views_drawings import (
     _get_page_manual_comments,
     _render_manual_comments_ui,
     _render_full_resolution_image,
+    _build_manual_comment_marker_image,
+    _annotated_image_output_path,
+    _render_shape_annotator,
+    _comment_has_shapes,
     _export_manual_comments_xlsx,
     _export_comment_annotated_pdf,
     _ensure_page_labels,
@@ -315,80 +319,12 @@ def _render_manual_review_workbench(doc: Document, project: Project):
             with col_exit:
                 if st.button("❌ 退出标注", key=f"cancel_annotate_{doc.id}_{page_number}"):
                     st.session_state[annotate_mode_key] = False
+                    st.session_state.pop(f"manual_shapes_{doc.id}_{page_number}", None)
                     st.rerun()
             with col_hint:
-                st.caption("🔴 标注模式：在下方图上按住鼠标**拖拽画一个矩形**来框选问题位置（绿色框为历史批注）。")
+                st.caption("🔴 标注模式：选择工具（矩形/圆形/箭头/文字）后在下方图上标注问题位置（绿色为历史批注）。")
 
-            resized_bg = None
-            canvas_w, canvas_h = 0, 0
-            try:
-                if not current_image.exists():
-                    st.error("⚠️ 图片文件不存在，无法进行位置标注。")
-                else:
-                    with Image.open(current_image) as bg:
-                        bg = bg.convert("RGB")
-                        orig_w, orig_h = bg.size
-                        # 宽度适配左栏（约占 70% 屏宽），保持宽高比
-                        canvas_w, canvas_h = _canvas_display_size(orig_w, orig_h, max_width=1000, max_height=850)
-                        resized_bg = bg.resize((canvas_w, canvas_h))
-            except Exception as e:
-                st.error(f"加载图片失败：{str(e)}")
-                canvas_w, canvas_h = 0, 0
-
-            if canvas_w > 0 and resized_bg is not None:
-                existing_rects = []
-                for c in page_comments:
-                    b = c.get("bbox")
-                    if isinstance(b, (list, tuple)) and len(b) == 4:
-                        existing_rects.append(_bbox_to_canvas_rect(b, canvas_w, canvas_h, stroke_color="#22c55e"))
-
-                canvas_result = st_canvas(
-                    fill_color="rgba(239, 68, 68, 0.12)",
-                    stroke_width=2,
-                    stroke_color="#ef4444",
-                    background_image=resized_bg,
-                    update_streamlit=True,
-                    height=canvas_h,
-                    width=canvas_w,
-                    drawing_mode="rect",
-                    display_toolbar=True,
-                    initial_drawing={"version": "4.4.0", "objects": existing_rects} if existing_rects else None,
-                    key=f"canvas_{doc.id}_{page_number}_large",
-                )
-
-                # 保存选定位置
-                if canvas_result is not None and canvas_result.json_data is not None:
-                    new_rects = [
-                        obj for obj in canvas_result.json_data.get("objects", [])
-                        if obj.get("type") == "rect" and obj.get("selectable", True)
-                    ]
-                    if new_rects:
-                        last = new_rects[-1]
-                        left = float(last.get("left", 0))
-                        top = float(last.get("top", 0))
-                        w = float(last.get("width", 0)) * float(last.get("scaleX", 1) or 1)
-                        h = float(last.get("height", 0)) * float(last.get("scaleY", 1) or 1)
-                        if w > 0 and h > 0:
-                            x1 = left / canvas_w
-                            y1 = top / canvas_h
-                            x2 = (left + w) / canvas_w
-                            y2 = (top + h) / canvas_h
-                            manual_bbox_norm = _normalize_manual_bbox((x1, y1, x2, y2))
-                            st.session_state[manual_bbox_key] = manual_bbox_norm
-
-                col_sel, col_clear = st.columns([3, 1])
-                with col_sel:
-                    if manual_bbox_norm:
-                        st.caption(
-                            f"✅ 已选定标注位置：({manual_bbox_norm[0]*100:.0f}%, {manual_bbox_norm[1]*100:.0f}%) → "
-                            f"({manual_bbox_norm[2]*100:.0f}%, {manual_bbox_norm[3]*100:.0f}%)"
-                        )
-                with col_clear:
-                    if manual_bbox_norm:
-                        if st.button("🗑️ 清除位置", key=f"clear_bbox_{doc.id}_{page_number}", use_container_width=True):
-                            st.session_state.pop(manual_bbox_key, None)
-                            manual_bbox_norm = None
-                            st.rerun()
+            _render_shape_annotator(doc, page_number, page_comments, current_image, canvas_max=1000)
 
         with col_comments:
             # 批注栏保持在右侧
@@ -409,11 +345,33 @@ def _render_manual_review_workbench(doc: Document, project: Project):
             if manual_focus_bbox:
                 st.caption(f"🔍 已定位到人工批注位置，图片自动放大居中；点查看器内“复位”可看整页。")
 
-            # key 随所选问题变化，确保 iframe 重新挂载并执行定位脚本
+            # 人工批注位置：可勾选在图上显示/隐藏绿色标注图形（默认显示）
+            has_comment_shapes = any(_comment_has_shapes(c) for c in page_comments)
+            show_markers = True
+            if has_comment_shapes:
+                show_markers = st.checkbox(
+                    "🟢 在图上显示人工批注标注",
+                    value=True,
+                    key=f"show_manual_markers_{doc.id}_{page_number}",
+                )
+
+            viewer_image = current_image
+            manual_marked = 0
+            if has_comment_shapes and show_markers:
+                base_path = _annotated_image_output_path(doc.project_id, doc.id, current_image, selected_index)
+                manual_marker_path = base_path.with_name(base_path.stem + "_人工.png")
+                try:
+                    viewer_image, manual_marked = _build_manual_comment_marker_image(
+                        current_image, page_comments, manual_marker_path
+                    )
+                except Exception:
+                    viewer_image, manual_marked = current_image, 0
+
+            # key 随所选问题/标注开关变化，确保 iframe 重新挂载并执行定位脚本
             focus_suffix = f"_{manual_focus_comment_id}" if manual_focus_comment_id else ""
-            viewer_key = f"manual_review_image_{doc.id}_{selected_index}{focus_suffix}"
+            viewer_key = f"manual_review_image_{doc.id}_{selected_index}{focus_suffix}_m{manual_marked}_{int(show_markers)}"
             _render_full_resolution_image(
-                current_image,
+                viewer_image,
                 f"{page_title}图纸",
                 key=viewer_key,
                 focus_bbox=manual_focus_bbox,

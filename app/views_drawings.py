@@ -999,6 +999,138 @@ def _normalize_manual_bbox(bbox) -> tuple[float, float, float, float] | None:
     return x1, y1, x2, y2
 
 
+# 标注图形类型：rect（矩形框）/ circle（圆形/椭圆）/ arrow（箭头）/ text（文字）
+MANUAL_SHAPE_TYPES = {"rect", "circle", "arrow", "text"}
+
+
+def _canvas_obj_bbox_px(obj: dict) -> tuple[float, float, float, float]:
+    """把 st_canvas 里一个 fabric 对象换算成画布像素坐标下的轴对齐外框 (l,t,r,b)。
+
+    兼容不同 originX/originY（矩形默认 left/top，线/点常为 center）以及缩放。
+    """
+    w = float(obj.get("width", 0)) * float(obj.get("scaleX", 1) or 1)
+    h = float(obj.get("height", 0)) * float(obj.get("scaleY", 1) or 1)
+    left = float(obj.get("left", 0))
+    top = float(obj.get("top", 0))
+    ox = obj.get("originX", "left")
+    oy = obj.get("originY", "top")
+    if ox == "center":
+        left -= w / 2
+    elif ox == "right":
+        left -= w
+    if oy == "center":
+        top -= h / 2
+    elif oy == "bottom":
+        top -= h
+    return left, top, left + w, top + h
+
+
+def _parse_canvas_shapes(json_data: dict, canvas_w: int, canvas_h: int,
+                         text_label: str = "") -> list[dict]:
+    """把 st_canvas 的绘制结果解析成归一化的标注图形列表。
+
+    - rect   → {"type":"rect","bbox":[x1,y1,x2,y2]}
+    - circle → {"type":"circle","bbox":[x1,y1,x2,y2]}（内切椭圆）
+    - line   → {"type":"arrow","points":[sx,sy,ex,ey]}（按拖拽方向定箭头指向）
+    - 落点   → {"type":"text","point":[x,y],"text":text_label}
+    坐标均归一化到 [0,1]；越界或退化图形忽略。
+    """
+    if not json_data or canvas_w <= 0 or canvas_h <= 0:
+        return []
+    shapes: list[dict] = []
+    for obj in json_data.get("objects", []):
+        otype = obj.get("type")
+        if otype == "rect":
+            l, t, r, b = _canvas_obj_bbox_px(obj)
+            nb = _normalize_manual_bbox((l / canvas_w, t / canvas_h, r / canvas_w, b / canvas_h))
+            if nb:
+                shapes.append({"type": "rect", "bbox": list(nb)})
+        elif otype == "circle":
+            # point 模式的落点也是小圆点(circle)；用半径区分：小半径当作文字落点，大半径当作圆形标注
+            radius = float(obj.get("radius", 0)) * float(obj.get("scaleX", 1) or 1)
+            if radius <= 6:
+                continue  # 交给下方文字逻辑处理
+            l, t, r, b = _canvas_obj_bbox_px(obj)
+            nb = _normalize_manual_bbox((l / canvas_w, t / canvas_h, r / canvas_w, b / canvas_h))
+            if nb:
+                shapes.append({"type": "circle", "bbox": list(nb)})
+        elif otype == "line":
+            l, t, r, b = _canvas_obj_bbox_px(obj)
+            # 依据原始 x1/x2、y1/y2 的方向决定箭头从哪个角指向哪个角
+            x1r = float(obj.get("x1", 0)); x2r = float(obj.get("x2", 0))
+            y1r = float(obj.get("y1", 0)); y2r = float(obj.get("y2", 0))
+            sx = l if x1r <= x2r else r
+            ex = r if x1r <= x2r else l
+            sy = t if y1r <= y2r else b
+            ey = b if y1r <= y2r else t
+            pts = [sx / canvas_w, sy / canvas_h, ex / canvas_w, ey / canvas_h]
+            pts = [max(0.0, min(1.0, v)) for v in pts]
+            if abs(pts[0] - pts[2]) > 1e-3 or abs(pts[1] - pts[3]) > 1e-3:
+                shapes.append({"type": "arrow", "points": pts})
+    # 文字标注：取第一个小落点，配合输入的文字（一条批注一处文字）
+    if text_label.strip():
+        for obj in json_data.get("objects", []):
+            if obj.get("type") in ("circle", "point"):
+                radius = float(obj.get("radius", 0)) * float(obj.get("scaleX", 1) or 1)
+                if obj.get("type") == "circle" and radius > 6:
+                    continue  # 这是圆形标注，不是文字落点
+                l, t, r, b = _canvas_obj_bbox_px(obj)
+                px = ((l + r) / 2) / canvas_w
+                py = ((t + b) / 2) / canvas_h
+                if 0 <= px <= 1 and 0 <= py <= 1:
+                    shapes.append({
+                        "type": "text",
+                        "point": [max(0.0, min(1.0, px)), max(0.0, min(1.0, py))],
+                        "text": text_label.strip(),
+                    })
+                    break
+    return shapes
+
+
+def _shapes_union_bbox(shapes: list[dict]) -> tuple[float, float, float, float] | None:
+    """求所有图形的并集外框（归一化），用于「查看位置」自动放大居中。"""
+    xs: list[float] = []
+    ys: list[float] = []
+    for sp in shapes or []:
+        if sp.get("type") in ("rect", "circle") and isinstance(sp.get("bbox"), (list, tuple)):
+            b = sp["bbox"]
+            xs += [float(b[0]), float(b[2])]
+            ys += [float(b[1]), float(b[3])]
+        elif sp.get("type") == "arrow" and isinstance(sp.get("points"), (list, tuple)):
+            p = sp["points"]
+            xs += [float(p[0]), float(p[2])]
+            ys += [float(p[1]), float(p[3])]
+        elif sp.get("type") == "text" and isinstance(sp.get("point"), (list, tuple)):
+            xs.append(float(sp["point"][0]))
+            ys.append(float(sp["point"][1]))
+    if not xs or not ys:
+        return None
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
+    # 给点/退化框一点余量，方便定位
+    if x2 - x1 < 0.02:
+        x1, x2 = max(0.0, x1 - 0.03), min(1.0, x2 + 0.03)
+    if y2 - y1 < 0.02:
+        y1, y2 = max(0.0, y1 - 0.03), min(1.0, y2 + 0.03)
+    return x1, y1, x2, y2
+
+
+def _comment_shapes(comment: dict) -> list[dict]:
+    """读取一条批注的图形列表；兼容仅有旧 bbox 字段的历史数据（视为一个矩形）。"""
+    shapes = comment.get("shapes")
+    if isinstance(shapes, list) and shapes:
+        return shapes
+    b = comment.get("bbox")
+    if isinstance(b, (list, tuple)) and len(b) == 4:
+        return [{"type": "rect", "bbox": [float(v) for v in b[:4]]}]
+    return []
+
+
+def _comment_has_shapes(comment: dict) -> bool:
+    """判断一条批注是否含可在图上绘制的标注图形。"""
+    return bool(_comment_shapes(comment))
+
+
 def _build_review_marker_image(image_path: Path, page_items: list[dict], output_path: Path) -> tuple[Path, int]:
     """在原图上按“坐标”字段绘制编号方框/圆点，编号与右侧系统审核列表一致。
 
@@ -1039,6 +1171,103 @@ def _build_review_marker_image(image_path: Path, page_items: list[dict], output_
     output_path.parent.mkdir(parents=True, exist_ok=True)
     base_img.save(output_path, format="PNG")
     return output_path, marked
+
+
+def _build_manual_comment_marker_image(image_path: Path, page_comments: list[dict], output_path: Path) -> tuple[Path, int]:
+    """在原图上绘制人工批注的标注图形（绿色）与序号徽标，序号与右侧批注列表一致。
+
+    支持的图形：矩形框(rect)、圆形/椭圆(circle)、箭头(arrow)、文字(text)。
+    兼容仅有旧 bbox 字段的历史批注（视为一个矩形）。
+    返回 (输出图路径, 已标注批注数)。无任何图形时返回原图路径，标注数为 0。
+    """
+    import math
+
+    marked_comments = []
+    for idx, comment in enumerate(page_comments, start=1):
+        shapes = _comment_shapes(comment)
+        if shapes:
+            marked_comments.append((idx, shapes))
+    if not marked_comments:
+        return image_path, 0
+
+    with Image.open(image_path) as source:
+        base_img = source.convert("RGB")
+
+    width, height = base_img.size
+    draw = ImageDraw.Draw(base_img, "RGBA")
+    line_w = max(2, round(min(width, height) / 400))
+    badge_r = max(12, round(min(width, height) / 90))
+    badge_font = _load_annotation_font(max(16, round(min(width, height) / 70)))
+    text_font = _load_annotation_font(max(18, round(min(width, height) / 60)))
+    color = (22, 163, 74)  # 绿色，与画框选区色调一致
+    fill = color + (46,)
+
+    def _clampx(v):
+        return max(0.0, min(1.0, v)) * width
+
+    def _clampy(v):
+        return max(0.0, min(1.0, v)) * height
+
+    def _badge(bx, by, num):
+        draw.ellipse(
+            [bx - badge_r, by - badge_r, bx + badge_r, by + badge_r],
+            fill=color, outline=(255, 255, 255), width=max(1, line_w // 2),
+        )
+        num_w, num_h = _text_size(draw, num, badge_font)
+        draw.text((bx - num_w / 2, by - num_h / 2 - 1), num, fill="white", font=badge_font)
+
+    for idx, shapes in marked_comments:
+        num = str(idx)
+        # 徽标锚点：取该批注第一个图形的左上/起点
+        anchor = None
+        for sp in shapes:
+            stype = sp.get("type")
+            if stype == "rect" and isinstance(sp.get("bbox"), (list, tuple)):
+                x1, y1, x2, y2 = sp["bbox"]
+                px1, py1, px2, py2 = _clampx(x1), _clampy(y1), _clampx(x2), _clampy(y2)
+                draw.rectangle([px1, py1, px2, py2], fill=fill, outline=color, width=line_w)
+                if anchor is None:
+                    anchor = (px1, py1)
+            elif stype == "circle" and isinstance(sp.get("bbox"), (list, tuple)):
+                x1, y1, x2, y2 = sp["bbox"]
+                px1, py1, px2, py2 = _clampx(x1), _clampy(y1), _clampx(x2), _clampy(y2)
+                draw.ellipse([px1, py1, px2, py2], fill=fill, outline=color, width=line_w)
+                if anchor is None:
+                    anchor = (px1, py1)
+            elif stype == "arrow" and isinstance(sp.get("points"), (list, tuple)):
+                sx, sy, ex, ey = sp["points"]
+                psx, psy, pex, pey = _clampx(sx), _clampy(sy), _clampx(ex), _clampy(ey)
+                draw.line([psx, psy, pex, pey], fill=color, width=line_w)
+                # 箭头头部：两条短线
+                ang = math.atan2(pey - psy, pex - psx)
+                head = max(12, round(min(width, height) / 55))
+                spread = math.radians(28)
+                for da in (spread, -spread):
+                    hx = pex - head * math.cos(ang - da)
+                    hy = pey - head * math.sin(ang - da)
+                    draw.line([pex, pey, hx, hy], fill=color, width=line_w)
+                if anchor is None:
+                    anchor = (psx, psy)
+            elif stype == "text" and isinstance(sp.get("point"), (list, tuple)):
+                px, py = _clampx(sp["point"][0]), _clampy(sp["point"][1])
+                label = str(sp.get("text", "")).strip()
+                if label:
+                    tw, th = _text_size(draw, label, text_font)
+                    pad = max(4, line_w * 2)
+                    # 文字底衬（白底绿框）提升可读性
+                    draw.rectangle(
+                        [px, py, px + tw + pad * 2, py + th + pad * 2],
+                        fill=(255, 255, 255, 235), outline=color, width=line_w,
+                    )
+                    draw.text((px + pad, py + pad), label, fill=color, font=text_font)
+                if anchor is None:
+                    anchor = (px, py)
+        if anchor is not None:
+            _badge(anchor[0], anchor[1], num)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    base_img.save(output_path, format="PNG")
+    return output_path, len(marked_comments)
 
 
 def _review_item_text_for_page_match(item: dict) -> str:
@@ -1167,14 +1396,19 @@ def _add_manual_comment(doc_id: int, page_number: int, text: str,
                         verdict: str = "manual", rule_code: str | None = None,
                         location: str | None = None, problem: str | None = None,
                         suggestion: str | None = None, severity: str | None = None,
-                        bbox: tuple[float, float, float, float] | list[float] | None = None):
+                        bbox: tuple[float, float, float, float] | list[float] | None = None,
+                        uploaded_files: list | None = None,
+                        shapes: list[dict] | None = None):
     """新增一条当前页人工批注，并自动向量化入人工案例知识库.
 
     参数说明:
       - text: 兼容旧调用；未拆分成 problem/suggestion 时的整合文本。
       - problem / suggestion: 分开的“问题描述”和“建议方案”，两者至少一个非空即算有效。
-      - bbox: 可选归一化 (x1,y1,x2,y2)（[0,1]，左上原点），来自图上拖拽画框。
+      - bbox: 可选归一化 (x1,y1,x2,y2)（[0,1]，左上原点），来自图上拖拽画框（旧字段）。
+      - shapes: 可选标注图形列表（rect/circle/arrow/text），来自图上多图形标注。
+      - uploaded_files: 上传的附件文件列表（Streamlit UploadedFile）。
     """
+    from src.storage import project_dir
     # 允许两种入参方式：拆分 problem/suggestion 优先；否则用 text
     problem = (problem or "").strip()
     suggestion = (suggestion or "").strip()
@@ -1184,6 +1418,8 @@ def _add_manual_comment(doc_id: int, page_number: int, text: str,
         return
 
     project_id = None
+    attachments = []
+    uploaded_files = uploaded_files or []
     with session() as s:
         doc_db = s.query(Document).filter(Document.id == doc_id).first()
         if not doc_db:
@@ -1203,8 +1439,9 @@ def _add_manual_comment(doc_id: int, page_number: int, text: str,
         if not isinstance(page_comments, list):
             page_comments = []
         stamp = now_utc().isoformat()
+        comment_id = f"c_{uuid.uuid4().hex[:8]}"
         comment_row = {
-            "id": f"c_{uuid.uuid4().hex[:8]}",
+            "id": comment_id,
             "problem": problem,
             "suggestion": suggestion,
             "text": composed,  # 兼容旧代码/导出兜底
@@ -1216,6 +1453,39 @@ def _add_manual_comment(doc_id: int, page_number: int, text: str,
         norm_bbox = _normalize_manual_bbox(bbox)
         if norm_bbox is not None:
             comment_row["bbox"] = list(norm_bbox)
+        # 写入多图形标注（rect/circle/arrow/text）
+        valid_shapes = [
+            sp for sp in (shapes or [])
+            if isinstance(sp, dict) and sp.get("type") in MANUAL_SHAPE_TYPES
+        ]
+        if valid_shapes:
+            comment_row["shapes"] = valid_shapes
+            # 兼容旧「查看位置」逻辑：若未单独提供 bbox，用图形并集外框补一个 bbox
+            if norm_bbox is None:
+                union = _shapes_union_bbox(valid_shapes)
+                if union is not None:
+                    comment_row["bbox"] = list(union)
+        # 保存上传的附件到项目目录
+        if uploaded_files:
+            attach_dir = project_dir(project_id) / "comment_attachments" / comment_id
+            attach_dir.mkdir(parents=True, exist_ok=True)
+            for uf in uploaded_files:
+                if not uf.name:
+                    continue
+                # 使用 uuid 文件名避免冲突，保留原始文件名记录
+                ext = Path(uf.name).suffix
+                safe_name = f"{uuid.uuid4().hex[:12]}{ext}"
+                rel_path = f"comment_attachments/{comment_id}/{safe_name}"
+                full_path = project_dir(project_id) / rel_path
+                with open(full_path, "wb") as f:
+                    f.write(uf.getbuffer())
+                attachments.append({
+                    "name": uf.name,
+                    "path": rel_path,
+                    "size": uf.size,
+                })
+            if attachments:
+                comment_row["attachments"] = attachments
         page_comments.append(comment_row)
         comments[page_key] = page_comments
         data["manual_comments"] = comments
@@ -1293,6 +1563,7 @@ def _update_manual_comment(doc_id: int, page_number: int, comment_id: str,
 
 def _delete_manual_comment(doc_id: int, page_number: int, comment_id: str):
     """删除一条当前页人工批注."""
+    from src.storage import project_dir
     with session() as s:
         doc_db = s.query(Document).filter(Document.id == doc_id).first()
         if not doc_db or not doc_db.analysis_data_json:
@@ -1308,6 +1579,16 @@ def _delete_manual_comment(doc_id: int, page_number: int, comment_id: str):
         page_comments = comments.get(page_key)
         if not isinstance(page_comments, list):
             return
+        # 删除批注前，先删除附件文件
+        for comment in page_comments:
+            if comment.get("id") == comment_id:
+                attachments = comment.get("attachments")
+                if isinstance(attachments, list) and attachments and doc_db.project_id:
+                    attach_dir = project_dir(doc_db.project_id) / "comment_attachments" / comment_id
+                    if attach_dir.exists():
+                        import shutil
+                        shutil.rmtree(attach_dir)
+                break
         comments[page_key] = [c for c in page_comments if c.get("id") != comment_id]
         data["manual_comments"] = comments
         doc_db.analysis_data_json = json.dumps(data, ensure_ascii=False, indent=2)
@@ -1485,7 +1766,18 @@ def _draw_manual_comments_section(draw, manual_comments, width, sidebar_width, h
 
 def _build_comment_stitched_image(image_path: Path, page_number: int, comments: list[dict]) -> Image.Image:
     """将单页图纸与该页人工批注拼接为一张图（右侧批注栏，画布高度自适应）."""
-    with Image.open(image_path) as source:
+    # 先把批注的标注图形（矩形/圆/箭头/文字）烘焙到左侧图纸上
+    render_source = image_path
+    if any(_comment_has_shapes(c) for c in comments):
+        try:
+            import tempfile
+            tmp_marker = Path(tempfile.gettempdir()) / f"_pdf_marker_{page_number}_{image_path.stem}.png"
+            baked, _n = _build_manual_comment_marker_image(image_path, comments, tmp_marker)
+            render_source = baked
+        except Exception:
+            render_source = image_path
+
+    with Image.open(render_source) as source:
         base_img = source.convert("RGB")
 
     width, height = base_img.size
@@ -1746,14 +2038,37 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
         elif not CANVAS_AVAILABLE:
             st.caption("❌ `streamlit-drawable-canvas` 未安装，请先执行：`pip install streamlit-drawable-canvas`")
 
-        # key 随所选问题变化，确保 iframe 重新挂载并执行定位脚本
+        # 人工批注位置：可勾选在图上显示/隐藏绿色标注图形（默认显示）
+        has_comment_shapes = any(_comment_has_shapes(c) for c in page_comments)
+        show_markers = True
+        if has_comment_shapes:
+            show_markers = st.checkbox(
+                "🟢 在图上显示人工批注标注",
+                value=True,
+                key=f"show_manual_markers_{doc.id}_{page_number}",
+            )
+
+        viewer_image = display_image
+        manual_marked = 0
+        if has_comment_shapes and show_markers:
+            base_marker = _annotated_image_output_path(doc.project_id, doc.id, current_image, selected_index)
+            manual_marker_path = base_marker.with_name(base_marker.stem + "_人工.png")
+            try:
+                viewer_image, manual_marked = _build_manual_comment_marker_image(
+                    display_image, page_comments, manual_marker_path
+                )
+            except Exception:
+                viewer_image, manual_marked = display_image, 0
+
+        # key 随所选问题/标注开关变化，确保 iframe 重新挂载并执行定位脚本
         focus_suffix = f"{focus_idx or 0}_{manual_focus_comment_id or ''}"
-        viewer_key = f"review_legend_image_{doc.id}_{selected_index}_focus{focus_suffix}"
+        marker_suffix = f"_m{manual_marked}_{int(show_markers)}"
+        viewer_key = f"review_legend_image_{doc.id}_{selected_index}_focus{focus_suffix}{marker_suffix}"
         caption_title = f"第 {page_number} 页图纸"
         if page_label_suffix:
             caption_title = f"第 {page_number} 页 {page_label_suffix}"
         _render_full_resolution_image(
-            display_image,
+            viewer_image,
             caption_title,
             key=viewer_key,
             focus_bbox=final_focus_bbox,
@@ -1770,91 +2085,11 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
         if CANVAS_AVAILABLE and annotate_mode:
             st.divider()
             st.subheader("✏️ 标注问题位置")
-            # 使用更大的画布尺寸适配左侧宽栏
-            resized_bg = None
-            canvas_w, canvas_h = 0, 0
-            try:
-                if not current_image.exists():
-                    st.error("⚠️ 图片文件不存在，无法进行位置标注。")
-                else:
-                    with Image.open(current_image) as bg:
-                        bg = bg.convert("RGB")
-                        orig_w, orig_h = bg.size
-                        # 左侧比较宽，使用更大的 max_width
-                        canvas_w, canvas_h = _canvas_display_size(orig_w, orig_h, max_width=720, max_height=720)
-                        # 提前 resize，保持图片在 with 块内处理
-                        resized_bg = bg.resize((canvas_w, canvas_h))
-            except Exception as e:
-                st.error(f"加载图片失败：{str(e)}")
-                canvas_w, canvas_h = 0, 0
-
-            if canvas_w > 0 and resized_bg is not None:
-                # 把当前页已有的人工批注框作为绿色只读矩形叠在背景上
-                existing_rects = []
-                for c in page_comments:
-                    b = c.get("bbox")
-                    if isinstance(b, (list, tuple)) and len(b) == 4:
-                        existing_rects.append(_bbox_to_canvas_rect(b, canvas_w, canvas_h, stroke_color="#22c55e"))
-
-                st.caption("在下方图上按住鼠标**拖拽画一个矩形**来框选问题位置（已有的绿色框为历史批注）。画好后位置会自动保存，到右侧填写批注内容即可。")
-                canvas_result = st_canvas(
-                    fill_color="rgba(239, 68, 68, 0.12)",
-                    stroke_width=2,
-                    stroke_color="#ef4444",
-                    background_image=resized_bg,
-                    update_streamlit=True,
-                    height=canvas_h,
-                    width=canvas_w,
-                    drawing_mode="rect",
-                    display_toolbar=True,
-                    initial_drawing={"version": "4.4.0", "objects": existing_rects} if existing_rects else None,
-                    key=f"canvas_{doc.id}_{page_number}_large",
-                )
-
-                # 取最后一个由用户新画的矩形，保存到 session_state
-                if canvas_result is not None and canvas_result.json_data is not None:
-                    new_rects = [
-                        obj for obj in canvas_result.json_data.get("objects", [])
-                        if obj.get("type") == "rect" and obj.get("selectable", True)
-                    ]
-                    if new_rects:
-                        last = new_rects[-1]
-                        left = float(last.get("left", 0))
-                        top = float(last.get("top", 0))
-                        w = float(last.get("width", 0)) * float(last.get("scaleX", 1) or 1)
-                        h = float(last.get("height", 0)) * float(last.get("scaleY", 1) or 1)
-                        if w > 0 and h > 0:
-                            x1 = left / canvas_w
-                            y1 = top / canvas_h
-                            x2 = (left + w) / canvas_w
-                            y2 = (top + h) / canvas_h
-                            manual_bbox_norm = _normalize_manual_bbox((x1, y1, x2, y2))
-                            st.session_state[manual_bbox_key] = manual_bbox_norm
-
-                # 显示当前已选定位置
-                if manual_bbox_norm:
-                    st.caption(
-                        f"✅ 已选定标注位置：({manual_bbox_norm[0]*100:.0f}%, {manual_bbox_norm[1]*100:.0f}%) → "
-                        f"({manual_bbox_norm[2]*100:.0f}%, {manual_bbox_norm[3]*100:.0f}%)"
-                    )
-
-                # 取消和清除按钮
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("❌ 取消标注", key=f"cancel_annotate_{doc.id}_{page_number}", use_container_width=True):
-                        st.session_state[annotate_mode_key] = False
-                        st.rerun()
-                with col2:
-                    if manual_bbox_norm:
-                        if st.button("🗑️ 清除位置", key=f"clear_bbox_{doc.id}_{page_number}", use_container_width=True):
-                            st.session_state.pop(manual_bbox_key, None)
-                            manual_bbox_norm = None
-                            st.rerun()
-            elif annotate_mode:
-                # 加载失败，显示取消按钮
-                if st.button("❌ 取消标注", key=f"cancel_annotate_fail_{doc.id}_{page_number}", use_container_width=True):
-                    st.session_state[annotate_mode_key] = False
-                    st.rerun()
+            _render_shape_annotator(doc, page_number, page_comments, current_image, canvas_max=720)
+            if st.button("❌ 取消标注", key=f"cancel_annotate2_{doc.id}_{page_number}", use_container_width=True):
+                st.session_state[annotate_mode_key] = False
+                st.session_state.pop(f"manual_shapes_{doc.id}_{page_number}", None)
+                st.rerun()
 
     with col_review:
         _render_page_review_items(doc, page_number, current_page_items,
@@ -2039,12 +2274,52 @@ def _render_manual_comments_ui(doc: Document, page_number: int, page_comments: l
                             # 极端兜底：两段都为空但历史 text 也为空的行
                             st.markdown(comment.get("text", ""))
                         bbox = comment.get("bbox")
-                        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                        cshapes = _comment_shapes(comment)
+                        if cshapes:
+                            label_map = {"rect": "矩形", "circle": "圆形", "arrow": "箭头", "text": "文字"}
+                            counts: dict[str, int] = {}
+                            for sp in cshapes:
+                                counts[sp.get("type", "")] = counts.get(sp.get("type", ""), 0) + 1
+                            summary = "、".join(f"{label_map.get(k, k)}×{v}" for k, v in counts.items() if k)
+                            st.caption(f"📍 图上标注：{summary}")
+                        elif isinstance(bbox, (list, tuple)) and len(bbox) == 4:
                             st.caption(
                                 "📍 已标注图上位置："
                                 f"({bbox[0]*100:.0f}%, {bbox[1]*100:.0f}%) → "
                                 f"({bbox[2]*100:.0f}%, {bbox[3]*100:.0f}%)"
                             )
+                        # 显示附件列表和下载按钮
+                        attachments = comment.get("attachments")
+                        if isinstance(attachments, list) and attachments:
+                            from src.storage import project_dir
+                            st.divider()
+                            st.markdown(f"**📎 附件 ({len(attachments)})：**")
+                            for idx_attach, attach in enumerate(attachments):
+                                attach_name = attach.get("name", "unknown")
+                                attach_path = attach.get("path", "")
+                                if not attach_path:
+                                    continue
+                                full_path = project_dir(doc.project_id) / attach_path
+                                if full_path.exists():
+                                    with open(full_path, "rb") as f:
+                                        file_data = f.read()
+                                    mime_type = None
+                                    ext = Path(attach_name).suffix.lower()
+                                    if ext in ['.png', '.jpg', '.jpeg']:
+                                        mime_type = f'image/{ext[1:]}'
+                                    elif ext == '.pdf':
+                                        mime_type = 'application/pdf'
+                                    elif ext in ['.doc']:
+                                        mime_type = 'application/msword'
+                                    elif ext in ['.docx']:
+                                        mime_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                                    st.download_button(
+                                        label=f"📥 {attach_name}",
+                                        data=file_data,
+                                        file_name=attach_name,
+                                        mime=mime_type,
+                                        key=f"download_{doc.id}_{page_number}_{comment_id}_{idx_attach}",
+                                    )
                         # 按钮行：根据是否有 bbox 调整列分布
                         if bbox is not None:
                             c1, c2, c3 = st.columns([1, 1, 1])
@@ -2102,14 +2377,23 @@ def _render_add_manual_comment(doc: Document, page_number: int, page_comments: l
                     st.rerun()
 
     if not CANVAS_AVAILABLE:
-        st.caption("💡 提示：安装 `streamlit-drawable-canvas` 后可在左侧大图上拖拽画框选定批注位置。")
-    elif manual_bbox_norm:
-        st.caption(
-            f"📍 已在左侧大图标注位置：({manual_bbox_norm[0]*100:.0f}%, {manual_bbox_norm[1]*100:.0f}%) → "
-            f"({manual_bbox_norm[2]*100:.0f}%, {manual_bbox_norm[3]*100:.0f}%)"
-        )
+        st.caption("💡 提示：安装 `streamlit-drawable-canvas` 后可在左侧大图上标注（矩形/圆形/箭头/文字）批注位置。")
     else:
-        st.caption("💡 点击右侧「标注位置」后在大图上拖拽画框可标注问题位置（不需要标注位置时直接填写内容添加即可）。")
+        pending_shapes = st.session_state.get(f"manual_shapes_{doc.id}_{page_number}", []) or []
+        if pending_shapes:
+            label_map = {"rect": "矩形", "circle": "圆形", "arrow": "箭头", "text": "文字"}
+            counts: dict[str, int] = {}
+            for sp in pending_shapes:
+                counts[sp.get("type", "")] = counts.get(sp.get("type", ""), 0) + 1
+            summary = "、".join(f"{label_map.get(k, k)}×{v}" for k, v in counts.items() if k)
+            st.caption(f"📍 已在左侧大图标注：{summary}（添加批注后生效）")
+        elif manual_bbox_norm:
+            st.caption(
+                f"📍 已在左侧大图标注位置：({manual_bbox_norm[0]*100:.0f}%, {manual_bbox_norm[1]*100:.0f}%) → "
+                f"({manual_bbox_norm[2]*100:.0f}%, {manual_bbox_norm[3]*100:.0f}%)"
+            )
+        else:
+            st.caption("💡 点击右侧「标注位置」后可在大图上用矩形/圆形/箭头/文字标注问题（不需要标注时直接填写内容添加即可）。")
 
     # 用 form + clear_on_submit=True，提交成功后 Streamlit 自动清空表单内所有输入。
     form_key = f"new_comment_form_{doc.id}_{page_number}"
@@ -2126,20 +2410,31 @@ def _render_add_manual_comment(doc: Document, page_number: int, page_comments: l
             height=80,
             key=f"new_comment_suggestion_{doc.id}_{page_number}",
         )
+        # 附件上传
+        uploaded_files = st.file_uploader(
+            "📎 附件（可选）",
+            accept_multiple_files=True,
+            help="可上传图片、PDF、Word 等文件作为批注附件，点击文件名可下载",
+            key=f"new_comment_attachments_{doc.id}_{page_number}",
+        )
         submitted = st.form_submit_button("➕ 添加批注", type="primary")
 
     if submitted:
         if not (new_problem.strip() or new_suggestion.strip()):
             st.warning("请至少填写“问题描述”或“建议方案”其中之一。")
             return
+        pending_shapes = st.session_state.get(f"manual_shapes_{doc.id}_{page_number}", []) or []
         _add_manual_comment(
             doc.id, page_number, text="",
             problem=new_problem, suggestion=new_suggestion,
             bbox=manual_bbox_norm,
+            uploaded_files=uploaded_files,
+            shapes=pending_shapes,
         )
-        # 添加成功后清除已标注的 bbox，并自动退出标注模式
+        # 添加成功后清除已标注的 bbox/图形，并自动退出标注模式
         manual_bbox_key = f"manual_bbox_{doc.id}_{page_number}"
         st.session_state.pop(manual_bbox_key, None)
+        st.session_state.pop(f"manual_shapes_{doc.id}_{page_number}", None)
         st.session_state.pop(f"annotate_mode_{doc.id}_{page_number}", None)
         st.rerun()
 
@@ -2168,6 +2463,106 @@ def _bbox_to_canvas_rect(bbox: list | tuple, canvas_w: int, canvas_h: int, strok
         "evented": False,
         "hoverCursor": "default",
     }
+
+
+def _render_shape_annotator(doc: Document, page_number: int, page_comments: list[dict],
+                            current_image: Path, canvas_max: int = 720,
+                            key_suffix: str = "") -> list[dict]:
+    """通用「标注图形」画布：支持矩形/圆形/箭头/文字/自由画，返回解析后的图形列表。
+
+    - 顶部提供工具选择；文字工具下额外要求填写文字内容并在图上点一个落点。
+    - 已有批注的图形会烘焙进背景图，作为参考（只读，不可编辑）。
+    - 结果同时写入 session_state[f"manual_shapes_{doc.id}_{page_number}"]，供提交时读取。
+    """
+    shapes_key = f"manual_shapes_{doc.id}_{page_number}"
+    resized_bg = None
+    canvas_w, canvas_h = 0, 0
+    try:
+        if not current_image.exists():
+            st.error("⚠️ 图片文件不存在，无法进行位置标注。")
+            return st.session_state.get(shapes_key, []) or []
+        # 背景图用「已烘焙历史批注」的图，让用户看到已有标注避免重复
+        bg_source = current_image
+        try:
+            base_marker = _annotated_image_output_path(doc.project_id, doc.id, current_image, page_number - 1)
+            marker_path = base_marker.with_name(base_marker.stem + "_标注底图.png")
+            baked, _n = _build_manual_comment_marker_image(current_image, page_comments, marker_path)
+            bg_source = baked
+        except Exception:
+            bg_source = current_image
+        with Image.open(bg_source) as bg:
+            bg = bg.convert("RGB")
+            orig_w, orig_h = bg.size
+            canvas_w, canvas_h = _canvas_display_size(orig_w, orig_h, max_width=canvas_max, max_height=canvas_max)
+            resized_bg = bg.resize((canvas_w, canvas_h))
+    except Exception as e:
+        st.error(f"加载图片失败：{str(e)}")
+        return st.session_state.get(shapes_key, []) or []
+
+    if canvas_w <= 0 or resized_bg is None:
+        return st.session_state.get(shapes_key, []) or []
+
+    # 工具选择
+    tool_labels = {
+        "矩形框": "rect",
+        "圆形/椭圆": "circle",
+        "箭头": "line",
+        "文字": "point",
+        # "自由画": "freedraw",
+    }
+    tool_name = st.radio(
+        "标注工具",
+        list(tool_labels.keys()),
+        horizontal=True,
+        key=f"annotate_tool_{doc.id}_{page_number}{key_suffix}",
+    )
+    drawing_mode = tool_labels[tool_name]
+
+    text_label = ""
+    if drawing_mode == "point":
+        text_label = st.text_input(
+            "文字内容",
+            placeholder="输入要写在图上的文字，然后在图上点一下放置位置",
+            key=f"annotate_text_{doc.id}_{page_number}{key_suffix}",
+        )
+        st.caption("💡 文字模式：先填写文字内容，再在下图上**点一下**确定文字位置。")
+    elif drawing_mode == "line":
+        st.caption("💡 箭头模式：按住鼠标从起点拖到终点，箭头指向终点。")
+    elif drawing_mode == "circle":
+        st.caption("💡 圆形模式：按住鼠标拖拽画出椭圆/圆形圈住问题区域。")
+    elif drawing_mode == "freedraw":
+        st.caption("💡 自由画模式：按住鼠标随手勾画（自由线不会被保存为标注，仅供临时圈示）。")
+    else:
+        st.caption("💡 矩形模式：按住鼠标拖拽画一个矩形框住问题位置。")
+
+    st.caption("可连续画多个图形；画好后到右侧填写批注内容并「添加批注」即可保存。")
+    canvas_result = st_canvas(
+        fill_color="rgba(34, 197, 94, 0.15)",
+        stroke_width=3,
+        stroke_color="#16a34a",
+        background_image=resized_bg,
+        update_streamlit=True,
+        height=canvas_h,
+        width=canvas_w,
+        drawing_mode=drawing_mode,
+        display_toolbar=True,
+        point_display_radius=4,
+        key=f"canvas_shapes_{doc.id}_{page_number}{key_suffix}",
+    )
+
+    shapes: list[dict] = []
+    if canvas_result is not None and canvas_result.json_data is not None:
+        shapes = _parse_canvas_shapes(canvas_result.json_data, canvas_w, canvas_h, text_label=text_label)
+    st.session_state[shapes_key] = shapes
+
+    if shapes:
+        counts: dict[str, int] = {}
+        for sp in shapes:
+            counts[sp["type"]] = counts.get(sp["type"], 0) + 1
+        label_map = {"rect": "矩形", "circle": "圆形", "arrow": "箭头", "text": "文字"}
+        summary = "、".join(f"{label_map.get(k, k)}×{v}" for k, v in counts.items())
+        st.caption(f"✅ 已绘制：{summary}")
+    return shapes
 
 
 def _render_manual_bbox_picker(doc: Document, page_number: int, page_comments: list[dict],
