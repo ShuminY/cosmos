@@ -40,6 +40,7 @@ from views_drawings import (
     _render_shape_annotator,
     _comment_has_shapes,
     _export_manual_comments_xlsx,
+    _export_manual_comments_bundle,
     _export_comment_annotated_pdf,
     _ensure_page_labels,
     _load_page_labels,
@@ -691,15 +692,16 @@ def _render_manual_review_focus(doc: Document, project: Project):
     timestamp = format_beijing(doc.analyzed_at, '%Y%m%d_%H%M%S') if doc.analyzed_at else "export"
     col_e1, col_e2 = st.columns(2)
     with col_e1:
-        xlsx_bytes = _export_manual_comments_xlsx(doc, data)
+        bundle_bytes, bundle_ext, bundle_mime = _export_manual_comments_bundle(doc, data)
+        _is_zip = bundle_ext == "zip"
         st.download_button(
-            label="📝 导出人工批注 Excel",
-            data=xlsx_bytes or b"",
-            file_name=f"{Path(doc.filename).stem}_人工批注_{timestamp}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            label="📝 导出人工批注（含附件）" if _is_zip else "📝 导出人工批注 Excel",
+            data=bundle_bytes or b"",
+            file_name=f"{Path(doc.filename).stem}_人工批注_{timestamp}.{bundle_ext or 'xlsx'}",
+            mime=bundle_mime or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"manual_export_xlsx_{doc.id}",
-            disabled=xlsx_bytes is None,
-            help=None if xlsx_bytes else "暂无人工批注可导出",
+            disabled=bundle_bytes is None,
+            help="含文件附件时打包为 ZIP（Excel + 附件文件）" if _is_zip else (None if bundle_bytes else "暂无人工批注可导出"),
         )
     with col_e2:
         if st.button(

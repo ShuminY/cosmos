@@ -2838,7 +2838,8 @@ def _export_review_as_csv(review_items: list[dict]) -> str:
     return "﻿" + "\n".join(lines)
 
 
-def _export_manual_comments_xlsx(doc: Document, analysis_data: dict) -> bytes | None:
+def _export_manual_comments_xlsx(doc: Document, analysis_data: dict,
+                                 file_attachments_out: dict | None = None) -> bytes | None:
     """将所有页的人工批注导出为 Excel 字节流；无批注时返回 None.
 
     导出列（10 列）：
@@ -2846,6 +2847,12 @@ def _export_manual_comments_xlsx(doc: Document, analysis_data: dict) -> bytes | 
       建议方案 · 回复意见 · 回复时间 · 提疑人 · 状态 · 备注
     未来在 UI 里加了「回复意见/时间/状态/备注」等字段，会自动生效；
     当前未存的字段留空，供外部在 Excel 中手工补写。
+
+    批注附件处理：
+      - 图片附件（png/jpg 等）直接嵌入「备注」列，可在 Excel 里直接查看；
+      - 其它文件附件：若提供 file_attachments_out（{压缩包内相对路径: 源文件Path}），
+        则登记进去以便打包为 ZIP，并在「备注」里用超链接指向压缩包内的文件；
+        未提供时仅在「备注」里写明附件文件名。
     """
     comments_by_page = _load_manual_comments(analysis_data)
     if not comments_by_page:
@@ -2865,6 +2872,9 @@ def _export_manual_comments_xlsx(doc: Document, analysis_data: dict) -> bytes | 
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment
     from openpyxl.drawing.image import Image as XLImage
+    from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
+    from openpyxl.drawing.xdr import XDRPositiveSize2D
+    from openpyxl.utils.units import pixels_to_EMU
 
     wb = Workbook()
     ws = wb.active
@@ -2878,8 +2888,8 @@ def _export_manual_comments_xlsx(doc: Document, analysis_data: dict) -> bytes | 
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # 列宽（图片列相对宽一点以容纳嵌入的原图缩略）
-    widths = [12, 22, 42, 38, 42, 30, 18, 14, 12, 24]
+    # 列宽（图片列相对宽一点以容纳嵌入的原图缩略；备注列加宽以容纳附件图片/说明）
+    widths = [12, 22, 42, 38, 42, 30, 18, 14, 12, 44]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[chr(64 + i)].width = w
 
@@ -2949,6 +2959,76 @@ def _export_manual_comments_xlsx(doc: Document, analysis_data: dict) -> bytes | 
         attach_cache[cache_key] = dest
         return dest
 
+    from src.storage import project_dir as _project_dir
+
+    def _process_comment_attachments(issue_code: str, comment: dict) -> tuple[list[Path], list[str]]:
+        """处理批注上传的附件。
+
+        返回 (要嵌入备注列的图片路径列表, 备注里附加的文字说明行列表)。
+        - 图片附件：路径加入嵌入列表；
+        - 其它文件：登记到 file_attachments_out（若提供）以便打成 ZIP，并在备注里写超链接/文件名。
+        """
+        embed_images: list[Path] = []
+        note_lines: list[str] = []
+        raw = comment.get("attachments")
+        if not isinstance(raw, list) or not raw:
+            return embed_images, note_lines
+        try:
+            proj_root = _project_dir(doc.project_id)
+        except Exception:
+            proj_root = None
+        for att in raw:
+            if not isinstance(att, dict):
+                continue
+            name = att.get("name", "") or "附件"
+            rel = att.get("path", "")
+            if not rel or proj_root is None:
+                note_lines.append(f"📎 附件：{name}（文件缺失）")
+                continue
+            src_path = proj_root / rel
+            if not src_path.exists():
+                note_lines.append(f"📎 附件：{name}（文件缺失）")
+                continue
+            ext = Path(name).suffix.lower()
+            if ext in IMAGE_SUFFIXES:
+                embed_images.append(src_path)
+                note_lines.append(f"🖼️ 图片附件：{name}（见备注内嵌图）")
+            else:
+                if file_attachments_out is not None:
+                    # 打包到 ZIP 的 附件/ 目录，文件名带问题编号避免冲突
+                    zip_rel = f"附件/{issue_code}_{name}"
+                    n = 1
+                    while zip_rel in file_attachments_out:
+                        zip_rel = f"附件/{issue_code}_{n}_{name}"
+                        n += 1
+                    file_attachments_out[zip_rel] = src_path
+                    note_lines.append(f"📎 附件：见压缩包内「{zip_rel}」")
+                else:
+                    note_lines.append(f"📎 附件：{name}")
+        return embed_images, note_lines
+
+    def _embed_images_in_cell(images: list[Path], col_letter: str, row: int):
+        """把多张图片竖向堆叠嵌入到指定单元格（备注列），用偏移错开避免重叠。"""
+        y_off_px = 4
+        for img_path in images:
+            try:
+                xl_img = XLImage(str(img_path))
+                display_h = 120
+                with Image.open(img_path) as _probe:
+                    w_px, h_px = _probe.size
+                display_w = max(80, int(round(w_px / max(1, h_px) * display_h)))
+                display_w = min(display_w, 300)
+                col0 = ord(col_letter.upper()) - 65
+                marker = AnchorMarker(col=col0, colOff=pixels_to_EMU(2),
+                                      row=row - 1, rowOff=pixels_to_EMU(y_off_px))
+                size = XDRPositiveSize2D(pixels_to_EMU(display_w), pixels_to_EMU(display_h))
+                xl_img.anchor = OneCellAnchor(_from=marker, ext=size)
+                ws.add_image(xl_img)
+                y_off_px += display_h + 6
+            except Exception:
+                continue
+        return y_off_px
+
     row_idx = 2  # 表头是第 1 行
     global_seq = 0
     for page_key in sorted(comments_by_page.keys(), key=_page_num):
@@ -2987,10 +3067,23 @@ def _export_manual_comments_xlsx(doc: Document, analysis_data: dict) -> bytes | 
             ws.cell(row=row_idx, column=7, value=reply_time)
             ws.cell(row=row_idx, column=8, value=author)
             ws.cell(row=row_idx, column=9, value=status)
-            ws.cell(row=row_idx, column=10, value=note if note else f"批注时间：{time_str}")
+
+            # 处理批注上传的附件：图片嵌入备注列，其它文件登记进 ZIP 并在备注写说明
+            embed_images, attach_note_lines = _process_comment_attachments(issue_code, comment)
+            note_parts = []
+            if note:
+                note_parts.append(note)
+            else:
+                note_parts.append(f"批注时间：{time_str}")
+            note_parts.extend(attach_note_lines)
+            ws.cell(row=row_idx, column=10, value="\n".join(note_parts))
 
             # 行高足够放下缩略图；Excel 单位 pt ≈ 1.333 px
-            ws.row_dimensions[row_idx].height = 140
+            base_row_h = 140
+            if embed_images:
+                # 每张内嵌图约 120px + 间距，换算为行高（pt≈px*0.75）
+                base_row_h = max(base_row_h, int((len(embed_images) * 130 + 20) * 0.75))
+            ws.row_dimensions[row_idx].height = base_row_h
 
             # 嵌入图片附件到 D 列（原图分辨率，Excel 显示时按 xl_img.width/height 等比缩放）
             attachment_path = _attachment_for(page_num, comment)
@@ -3010,6 +3103,10 @@ def _export_manual_comments_xlsx(doc: Document, analysis_data: dict) -> bytes | 
                 except Exception:
                     # 图片嵌入失败退化为文件名
                     ws.cell(row=row_idx, column=4, value=attachment_path.name)
+
+            # 把批注的图片附件竖向嵌入「备注」列（J 列）
+            if embed_images:
+                _embed_images_in_cell(embed_images, "J", row_idx)
 
             # 自动换行 + 顶部对齐（问题/建议/回复/备注 各列）
             for col in (2, 3, 5, 6, 10):
@@ -3033,6 +3130,43 @@ def _export_manual_comments_xlsx(doc: Document, analysis_data: dict) -> bytes | 
     buffer = BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
+
+
+def _export_manual_comments_bundle(doc: Document, analysis_data: dict) -> tuple[bytes | None, str, str]:
+    """导出人工批注。
+
+    返回 (数据字节, 文件后缀, mime)：
+      - 若批注含非图片文件附件：打包为 ZIP（内含 Excel + 附件/ 目录下的原始文件），
+        Excel 的「备注」列用文字指向压缩包内文件；
+      - 否则：直接返回 Excel 字节（图片附件已内嵌到备注列）。
+      - 无批注时返回 (None, "", "")。
+    """
+    from io import BytesIO
+    from zipfile import ZipFile, ZIP_DEFLATED
+
+    file_attachments: dict[str, Path] = {}
+    xlsx_bytes = _export_manual_comments_xlsx(doc, analysis_data, file_attachments_out=file_attachments)
+    if xlsx_bytes is None:
+        return None, "", ""
+
+    if not file_attachments:
+        return (
+            xlsx_bytes,
+            "xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    # 有文件附件 → 打成 ZIP：Excel + 附件/ 原始文件
+    stem = Path(doc.filename).stem
+    buffer = BytesIO()
+    with ZipFile(buffer, "w", ZIP_DEFLATED) as zf:
+        zf.writestr(f"{stem}_人工批注.xlsx", xlsx_bytes)
+        for zip_rel, src_path in file_attachments.items():
+            try:
+                zf.write(str(src_path), zip_rel)
+            except Exception:
+                continue
+    return buffer.getvalue(), "zip", "application/zip"
 
 
 def _render_document_result(doc: Document):
@@ -3080,16 +3214,17 @@ def _render_document_result(doc: Document):
                     key=f"export_csv_{doc.id}",
                 )
             with col3:
-                # 导出人工批注 Excel
-                xlsx_bytes = _export_manual_comments_xlsx(doc, analysis_data)
+                # 导出人工批注 Excel（含附件时自动打包为 ZIP）
+                bundle_bytes, bundle_ext, bundle_mime = _export_manual_comments_bundle(doc, analysis_data)
+                _is_zip = bundle_ext == "zip"
                 st.download_button(
-                    label="📝 导出人工批注 Excel",
-                    data=xlsx_bytes or b"",
-                    file_name=f"{Path(doc.filename).stem}_人工批注_{timestamp}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    label="📝 导出人工批注（含附件）" if _is_zip else "📝 导出人工批注 Excel",
+                    data=bundle_bytes or b"",
+                    file_name=f"{Path(doc.filename).stem}_人工批注_{timestamp}.{bundle_ext or 'xlsx'}",
+                    mime=bundle_mime or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key=f"export_comments_xlsx_{doc.id}",
-                    disabled=xlsx_bytes is None,
-                    help=None if xlsx_bytes else "暂无人工批注可导出",
+                    disabled=bundle_bytes is None,
+                    help="含文件附件时打包为 ZIP（Excel + 附件文件）" if _is_zip else (None if bundle_bytes else "暂无人工批注可导出"),
                 )
             with col4:
                 # 导出人工批注结果（图纸+批注拼接后合成多页PDF）
