@@ -64,6 +64,15 @@ try:
 except ImportError:
     PDF2IMAGE_AVAILABLE = False
 
+try:
+    import ezdxf
+    from ezdxf.addons.drawing import RenderContext, Frontend
+    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+    EZDXF_AVAILABLE = True
+except ImportError:
+    ezdxf = None
+    EZDXF_AVAILABLE = False
+
 from src.chatbot import (
     get_available_providers, get_default_provider, get_image_messages,
     list_chat_sessions, vision_chat,
@@ -230,7 +239,336 @@ def _prepare_drawing_images(doc: Document, project_id: int) -> tuple[list[Path],
     if suffix in IMAGE_SUFFIXES:
         return [file_path], None
 
+    # DWG/DXF CAD 图纸格式
+    if suffix in (".dwg", ".dxf"):
+        return _convert_dwg_to_images(file_path, project_id, doc.id)
+
     return [], f"暂不支持该图纸格式: {suffix or '未知'}"
+
+
+def _convert_dwg_to_images(file_path: Path, project_id: int, doc_id: int) -> tuple[list[Path], str | None]:
+    """将 DWG/DXF 图纸转换为 PNG 预览图。
+
+    真实工程图纸含大量 HATCH/块，ezdxf 纯 Python 渲染会卡死，故优先外部引擎：
+
+    优先级：
+      1. ODA + LibreOffice（DWG 专用，最稳）：
+         - ODA File Converter: DWG → DXF R12（最兼容格式，约 10-60 秒，文件大）
+         - LibreOffice: DXF → PDF 渲染（能处理填充/块，约 10-20 秒）
+         - PyMuPDF: PDF → PNG 拆页
+      2. 纯 LibreOffice：DXF 文件无需 ODA，直接走 LibreOffice 渲染
+      3. ezdxf（兜底）：放子进程并限时 90 秒，超时即失败，避免卡死主应用
+    """
+    suffix = file_path.suffix.lower()
+    out_dir = Path("data") / "projects" / str(project_id) / "pdf_conversions" / str(doc_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    oda = _find_oda_converter()
+    lo = _find_libreoffice()
+
+    # ============= DWG =============
+    if suffix == ".dwg":
+        # 方案 1：ODA + LibreOffice（最优组合，唯一可处理真实图纸）
+        if oda and lo:
+            return _convert_dwg_via_oda_and_lo(file_path, out_dir, oda, lo)
+        # 方案 2：仅 ODA + ezdxf 兜底（慢，卡）
+        if oda and EZDXF_AVAILABLE:
+            return _convert_dwg_via_oda(file_path, out_dir, oda)
+        # 方案 3：仅 LibreOffice（新版 DWG 常打不开）
+        if lo:
+            paths, err = _convert_cad_via_libreoffice(file_path, out_dir)
+            if paths:
+                return paths, None
+            return [], (
+                f"DWG 预览失败：你的 AutoCAD DWG 版本较新，LibreOffice 无法直接打开。\n"
+                "建议：安装 ODA File Converter（cad-manager-odafileconverter.com），\n"
+                "或先在 AutoCAD 里把 DWG 另存为 R12 版 DXF 再上传。\n"
+                f"原文件已保存，可点击下载按钮获取。{err and '详细错误: '+err[:100] or ''}"
+            )
+        return [], _cad_missing_tool_message(None)
+
+    # ============= DXF =============
+    if suffix == ".dxf":
+        # 方案 1：LibreOffice 直接渲染（最稳最快）
+        if lo:
+            paths, err = _convert_cad_via_libreoffice(file_path, out_dir)
+            if paths:
+                return paths, None
+            # 失败了，继续试 ezdxf
+        # 方案 2：ezdxf（兜底）
+        if EZDXF_AVAILABLE:
+            return _render_dxf_to_images_safe(file_path, out_dir)
+        return [], _cad_missing_tool_message(None)
+
+    return [], f"不支持的 CAD 格式: {suffix}"
+
+
+def _cad_missing_tool_message(lo_err: str | None = None) -> str:
+    """DWG/DXF 无可用渲染工具时的统一提示。"""
+    base = (
+        "CAD 图纸已上传，但预览需要 LibreOffice（推荐）来渲染。\n"
+        "请安装 LibreOffice 后重启应用即可自动预览；当前文件已保存，可点击下载获取原文件。"
+    )
+    if lo_err:
+        base += f"\n（LibreOffice 转换未成功：{lo_err[:120]}）"
+    return base
+
+
+def _convert_cad_via_libreoffice(file_path: Path, out_dir: Path) -> tuple[list[Path], str | None]:
+    """用 LibreOffice 把 DWG/DXF 转为 PDF，再用 PyMuPDF 拆成多页 PNG。"""
+    import tempfile
+    import shutil
+    lo = _find_libreoffice()
+    if not lo:
+        return [], "未找到 LibreOffice"
+    if not PYMUPDF_AVAILABLE:
+        return [], "需要 PyMuPDF 才能把 PDF 拆成 PNG"
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        result = subprocess.run(
+            [lo, "--headless", "--convert-to", "pdf", "--outdir", str(tmp_dir), str(file_path)],
+            capture_output=True, text=True, timeout=300,
+        )
+        pdf_files = sorted(tmp_dir.glob("*.pdf"))
+        if not pdf_files:
+            return [], f"LibreOffice 转换失败：{(result.stderr or result.stdout or '')[:200]}"
+        import fitz as _fitz
+        pdf = _fitz.open(str(pdf_files[0]))
+        image_paths = []
+        try:
+            for i in range(pdf.page_count):
+                page = pdf.load_page(i)
+                pix = page.get_pixmap(dpi=150)
+                out_path = out_dir / f"page_{i + 1:03d}.png"
+                pix.save(str(out_path))
+                image_paths.append(out_path)
+        finally:
+            pdf.close()
+        if not image_paths:
+            return [], "LibreOffice 生成的 PDF 未包含页面"
+        return image_paths, None
+    except subprocess.TimeoutExpired:
+        return [], "LibreOffice 转换超时（图纸过大，超过 5 分钟）"
+    except Exception as e:
+        return [], f"LibreOffice 转换异常: {str(e)}"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _render_dxf_to_images(file_path: Path, out_dir: Path) -> tuple[list[Path], str | None]:
+    """用 ezdxf + matplotlib 把 DXF 渲染为多页 PNG。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    try:
+        doc = ezdxf.readfile(str(file_path))
+    except Exception as e:
+        return [], f"无法读取 DXF 文件: {str(e)}"
+
+    msp = doc.modelspace()
+    # 收集有内容的 layout：优先 modelspace；paperspace 仅在含实体时才渲染
+    layouts = [msp]
+    for name in sorted(doc.layouts.names()):
+        if name == "Model":
+            continue
+        try:
+            layout = doc.layouts.get(name)
+            if any(True for _ in layout):  # layout 含实体才加入
+                layouts.append(layout)
+        except Exception:
+            continue
+
+    image_paths = []
+    for idx, layout in enumerate(layouts):
+        out_path = out_dir / f"page_{idx + 1:03d}.png"
+        try:
+            fig = plt.figure(figsize=(16, 12))
+            ax = fig.add_axes([0, 0, 1, 1])
+            ctx = RenderContext(doc)
+            # 黑色背景 + 白色线条（CAD 图纸标准配色）
+            ax.set_facecolor("#1a1a2e")
+            Frontend(ctx, MatplotlibBackend(ax)).draw_layout(layout, finalize=True)
+            fig.savefig(str(out_path), dpi=150, facecolor="#1a1a2e")
+            plt.close(fig)
+            image_paths.append(out_path)
+        except Exception:
+            plt.close("all")
+            continue
+
+    if not image_paths:
+        return [], "DXF 文件渲染失败：未生成任何页面"
+    return image_paths, None
+
+
+def _render_dxf_to_images_safe(file_path: Path, out_dir: Path,
+                               timeout: int = 90) -> tuple[list[Path], str | None]:
+    """在独立子进程里限时运行 ezdxf 渲染，避免复杂图纸卡死主应用。
+
+    真实工程图纸含大量 HATCH/块，ezdxf 渲染可能耗时数分钟甚至假死；
+    这里放到子进程并设硬超时，超时即杀掉进程返回错误，主应用不受影响。
+    """
+    import sys
+    import json as _json
+    module_dir = str(Path(__file__).resolve().parent)
+    code = (
+        "import sys, json\n"
+        f"sys.path.insert(0, {module_dir!r})\n"
+        "from pathlib import Path\n"
+        "import views_drawings as v\n"
+        "fp, od = sys.argv[1], sys.argv[2]\n"
+        "paths, err = v._render_dxf_to_images(Path(fp), Path(od))\n"
+        "print('__RESULT__' + json.dumps({'paths': [str(p) for p in paths], 'err': err}))\n"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(file_path), str(out_dir)],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return [], (
+            f"DXF 渲染超时（{timeout}s）：该图纸元素过多（填充/块引用）。"
+            "建议安装 LibreOffice 以获得可靠的 CAD 预览。"
+        )
+    except Exception as e:
+        return [], f"DXF 渲染子进程异常: {str(e)}"
+
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("__RESULT__"):
+            try:
+                data = _json.loads(line[len("__RESULT__"):])
+                paths = [Path(p) for p in data.get("paths", []) if Path(p).exists()]
+                return paths, data.get("err")
+            except Exception:
+                break
+    return [], f"DXF 渲染失败：{(result.stderr or '')[:200]}"
+
+
+def _find_oda_converter() -> str | None:
+    """查找 ODA File Converter 可执行文件路径。"""
+    import shutil
+    candidates = [
+        "ODAFileConverter",
+        "/Applications/ODAFileConverter.app/Contents/MacOS/ODAFileConverter",
+        "/Applications/ODA File Converter.app/Contents/MacOS/ODAFileConverter",
+        "/usr/bin/ODAFileConverter",
+        "/usr/local/bin/ODAFileConverter",
+        "C:/Program Files/ODA/ODAFileConverter.exe",
+    ]
+    for c in candidates:
+        if shutil.which(c) or Path(c).exists():
+            return c
+    return None
+
+
+def _convert_dwg_via_oda(file_path: Path, out_dir: Path, oda_exe: str) -> tuple[list[Path], str | None]:
+    """用 ODA File Converter 把 DWG 转为 DXF，再渲染为 PNG。
+
+    ODA 的输入参数是「目录」而非单个文件，会转换目录内所有 DWG。
+    因此先把目标 DWG 单独复制到一个隔离的输入目录，避免误转同目录其它文件。
+    """
+    import tempfile
+    import shutil
+    in_dir = Path(tempfile.mkdtemp())
+    out_tmp = Path(tempfile.mkdtemp())
+    try:
+        # 只把目标文件放进输入目录
+        staged = in_dir / file_path.name
+        shutil.copy2(str(file_path), str(staged))
+        result = subprocess.run(
+            [oda_exe, str(in_dir), str(out_tmp), "ACAD2018", "DXF", "0", "1"],
+            capture_output=True, text=True, timeout=300,
+        )
+        dxf_files = sorted(out_tmp.glob("*.dxf"))
+        if not dxf_files:
+            return [], f"ODA 转换 DWG→DXF 失败：{(result.stderr or result.stdout or '')[:200]}"
+        return _render_dxf_to_images_safe(dxf_files[0], out_dir)
+    except subprocess.TimeoutExpired:
+        return [], "ODA 转换超时（图纸过大，超过 5 分钟）"
+    except Exception as e:
+        return [], f"ODA 转换异常: {str(e)}"
+    finally:
+        shutil.rmtree(in_dir, ignore_errors=True)
+        shutil.rmtree(out_tmp, ignore_errors=True)
+
+
+def _find_libreoffice() -> str | None:
+    """查找 LibreOffice 可执行文件。"""
+    import shutil
+    candidates = [
+        "soffice", "libreoffice",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/usr/bin/soffice", "/usr/bin/libreoffice",
+        "C:/Program Files/LibreOffice/program/soffice.exe",
+    ]
+    for c in candidates:
+        if shutil.which(c) or Path(c).exists():
+            return c
+    return None
+
+
+def _convert_dwg_via_oda_and_lo(file_path: Path, out_dir: Path,
+                                 oda_exe: str, lo_exe: str) -> tuple[list[Path], str | None]:
+    """DWG 预览主链路：ODA 转 DXF R12 → LibreOffice 渲染 PDF → PyMuPDF 拆 PNG。
+
+    真实工程图含大量 HATCH/块，这是目前唯一能把这些图纸可靠渲染出来的组合。
+    ODA 转 DXF 用 R12 格式（最古老最兼容，LibreOffice 一定认得），虽体积比 2018 版大，
+    但转换速度相差不大，优先保证能被 LibreOffice 打开。
+    """
+    import tempfile
+    import shutil
+    in_dir = Path(tempfile.mkdtemp())
+    dxf_out = Path(tempfile.mkdtemp())
+    pdf_out = Path(tempfile.mkdtemp())
+    try:
+        # 第一步：ODA File Converter DWG → DXF R12
+        staged = in_dir / file_path.name
+        shutil.copy2(str(file_path), str(staged))
+        result = subprocess.run(
+            [oda_exe, str(in_dir), str(dxf_out), "ACAD12", "DXF", "0", "1"],
+            capture_output=True, text=True, timeout=480,  # 大文件最多 8 分钟
+        )
+        dxf_files = sorted(dxf_out.glob("*.dxf"))
+        if not dxf_files:
+            return [], f"ODA 转换 DWG→DXF 失败：{(result.stderr or result.stdout or '')[:200]}"
+
+        # 第二步：LibreOffice DXF → PDF
+        result2 = subprocess.run(
+            [lo_exe, "--headless", "--convert-to", "pdf",
+             "--outdir", str(pdf_out), str(dxf_files[0])],
+            capture_output=True, text=True, timeout=180,
+        )
+        pdf_files = sorted(pdf_out.glob("*.pdf"))
+        if not pdf_files:
+            return [], f"LibreOffice 渲染 DXF 失败：{(result2.stderr or result2.stdout or '')[:200]}"
+
+        # 第三步：PyMuPDF PDF → PNG 拆页
+        if not PYMUPDF_AVAILABLE:
+            return [], "需要 PyMuPDF 才能拆 PDF 为 PNG"
+        import fitz as _fitz
+        pdf = _fitz.open(str(pdf_files[0]))
+        image_paths = []
+        try:
+            for i in range(pdf.page_count):
+                page = pdf.load_page(i)
+                pix = page.get_pixmap(dpi=150)
+                out_path = out_dir / f"page_{i + 1:03d}.png"
+                pix.save(str(out_path))
+                image_paths.append(out_path)
+        finally:
+            pdf.close()
+        if not image_paths:
+            return [], "PDF 拆页后未生成图片"
+        return image_paths, None
+    except subprocess.TimeoutExpired:
+        return [], "DWG 预览超时（图纸过大，请检查上传文件大小）"
+    except Exception as e:
+        return [], f"DWG 预览异常: {str(e)}"
+    finally:
+        shutil.rmtree(in_dir, ignore_errors=True)
+        shutil.rmtree(dxf_out, ignore_errors=True)
+        shutil.rmtree(pdf_out, ignore_errors=True)
 
 
 # ============ 页面标题（图名 + 图号）提取 ============
@@ -617,6 +955,19 @@ def _display_preview(project_id: int, doc: Document, width: int = 240):
             st.info("PDF将在开始分析时先转换为PNG预览")
         return
 
+    if file_path.suffix.lower() in (".dwg", ".dxf"):
+        conversion_dir = Path("data") / "projects" / str(project_id) / "pdf_conversions" / str(doc.id)
+        pages = sorted(conversion_dir.glob("page_*.png"))
+        if pages:
+            st.image(str(pages[0]), width=width, caption=f"CAD预览: {pages[0].name}")
+        else:
+            suffix = file_path.suffix.lower()
+            if suffix == ".dxf":
+                st.info("DXF 文件已上传，请在打开审核时等待渲染。")
+            else:
+                st.info("DWG 文件预览需要系统安装 LibreOffice 或 ODA File Converter。文件已保存，可下载原文件。")
+        return
+
     st.info("该文件类型暂不支持预览")
 
 
@@ -871,6 +1222,55 @@ def _find_chinese_font_path() -> str | None:
                 return str(font_file)
 
     return None
+
+
+def _cached_base64_image(path: Path) -> str:
+    """在 session_state 中缓存图片的 base64 编码，避免每帧重复读盘/编码。
+
+    缓存键 = (path, mtime, size)，文件未变就不重新编码；最多缓存 8 张，溢出淘汰最旧。
+    """
+    cache = st.session_state.setdefault("_b64_cache", {})
+    try:
+        stat = path.stat()
+        key = f"{path.resolve()}_{stat.st_mtime}_{stat.st_size}"
+    except Exception:
+        key = str(path)
+    if key in cache:
+        return cache[key]
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    cache[key] = data
+    if len(cache) > 8:
+        for k in list(cache)[:-8]:
+            del cache[k]
+    return data
+
+
+def _cached_marker_image(image_path: Path, page_comments: list[dict],
+                         output_path: Path, build_func) -> tuple[Path, int]:
+    """缓存标注图生成结果，仅在源图或批注列表变化时重新烘焙。
+
+    build_func(image_path, page_comments, output_path) → (Path, int)
+    """
+    import hashlib
+    comments_json = json.dumps(page_comments, sort_keys=True, ensure_ascii=False)
+    try:
+        src_mtime = image_path.stat().st_mtime
+    except Exception:
+        src_mtime = 0
+    comments_hash = hashlib.md5(comments_json.encode()).hexdigest()[:16]
+    cache_key = f"{output_path.name}_{src_mtime}_{comments_hash}"
+    cache = st.session_state.setdefault("_marker_cache", {})
+    cached = cache.get(cache_key)
+    if cached is not None:
+        cached_path = Path(cached[0])
+        if cached_path.exists():
+            return cached_path, cached[1]
+    result = build_func(image_path, page_comments, output_path)
+    cache[cache_key] = (str(result[0]), result[1])
+    if len(cache) > 16:
+        for k in list(cache)[:-16]:
+            del cache[k]
+    return result
 
 
 def _load_annotation_font(size: int, bold: bool = False):
@@ -2054,16 +2454,18 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
             base_marker = _annotated_image_output_path(doc.project_id, doc.id, current_image, selected_index)
             manual_marker_path = base_marker.with_name(base_marker.stem + "_人工.png")
             try:
-                viewer_image, manual_marked = _build_manual_comment_marker_image(
-                    display_image, page_comments, manual_marker_path
+                viewer_image, manual_marked = _cached_marker_image(
+                    display_image, page_comments, manual_marker_path,
+                    _build_manual_comment_marker_image,
                 )
             except Exception:
                 viewer_image, manual_marked = display_image, 0
 
-        # key 随所选问题/标注开关变化，确保 iframe 重新挂载并执行定位脚本
-        focus_suffix = f"{focus_idx or 0}_{manual_focus_comment_id or ''}"
-        marker_suffix = f"_m{manual_marked}_{int(show_markers)}"
-        viewer_key = f"review_legend_image_{doc.id}_{selected_index}_focus{focus_suffix}{marker_suffix}"
+        # 稳定的 viewer key：仅在图片或焦点目标实际变化时才改变，避免 iframe 重复挂载
+        # 焦点目标用 bbox 的 hash 值（而非 focus_idx 等易变状态）
+        _tmp_focus = final_focus_bbox or ()
+        _focus_hash = hash(tuple(round(v, 4) for v in _tmp_focus)) if _tmp_focus else 0
+        viewer_key = f"review_legend_image_{doc.id}_{selected_index}_{Path(viewer_image).stem}_{_focus_hash}"
         caption_title = f"第 {page_number} 页图纸"
         if page_label_suffix:
             caption_title = f"第 {page_number} 页 {page_label_suffix}"
@@ -2486,7 +2888,10 @@ def _render_shape_annotator(doc: Document, page_number: int, page_comments: list
         try:
             base_marker = _annotated_image_output_path(doc.project_id, doc.id, current_image, page_number - 1)
             marker_path = base_marker.with_name(base_marker.stem + "_标注底图.png")
-            baked, _n = _build_manual_comment_marker_image(current_image, page_comments, marker_path)
+            baked, _n = _cached_marker_image(
+                current_image, page_comments, marker_path,
+                _build_manual_comment_marker_image,
+            )
             bg_source = baked
         except Exception:
             bg_source = current_image
@@ -2647,7 +3052,7 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
         st.image(str(image_path), caption=caption, width="stretch")
         return
 
-    data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    data = _cached_base64_image(image_path)
     safe_key = re.sub(r"[^a-zA-Z0-9_-]", "_", key)
     focus_json = json.dumps(list(focus_bbox)) if focus_bbox else "null"
     if focus_bbox:
@@ -2670,7 +3075,6 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
 </div>
 <script>
 (function() {{
-  const base64 = '{data}';
   const focus = {focus_json};
   const img = document.getElementById('img-{safe_key}');
   const frame = document.getElementById('frame-{safe_key}');
@@ -2762,12 +3166,7 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
   }});
 
   document.getElementById('open-{safe_key}').addEventListener('click', function() {{
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {{ bytes[i] = binary.charCodeAt(i); }}
-    const blob = new Blob([bytes], {{ type: 'image/png' }});
-    const url = URL.createObjectURL(blob);
-    window.open(url, '_blank', 'noopener,noreferrer');
+    window.open(img.src, '_blank', 'noopener,noreferrer');
   }});
 
   // 初次渲染：有定位框则放大居中，否则自适应
@@ -3740,7 +4139,7 @@ def view_new_drawing_analysis(project: Project):
     else:
         uploaded_file = st.file_uploader(
             "上传图纸文件",
-            type=["pdf", "png", "jpg", "jpeg", "webp", "bmp"],
+            type=["pdf", "png", "jpg", "jpeg", "webp", "bmp", "dwg", "dxf"],
             accept_multiple_files=False,
             key="drawing_analysis_upload_file",
             help="上传后会保存到项目图纸分类，并作为本次待分析图纸。",

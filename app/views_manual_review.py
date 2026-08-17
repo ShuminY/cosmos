@@ -36,6 +36,7 @@ from views_drawings import (
     _render_manual_comments_ui,
     _render_full_resolution_image,
     _build_manual_comment_marker_image,
+    _cached_marker_image,
     _annotated_image_output_path,
     _render_shape_annotator,
     _comment_has_shapes,
@@ -121,10 +122,10 @@ def _select_or_upload_doc(project: Project) -> Document | None:
     st.caption("此页只负责上传新图纸；支持批量上传多个文件，上传后请到「人工审核列表」中进行批注和查看。")
     uploaded_files = st.file_uploader(
         "上传图纸文件",
-        type=["pdf", "png", "jpg", "jpeg", "webp", "bmp"],
+        type=["pdf", "png", "jpg", "jpeg", "webp", "bmp", "dwg", "dxf"],
         accept_multiple_files=True,
         key="manual_review_upload_file",
-        help="支持批量选择多个文件，上传后会保存到项目图纸分类，作为人工审核对象。",
+        help="支持 PDF、图片及 CAD 图纸（DWG/DXF）。DWG 预览需系统安装 LibreOffice 或 ODA File Converter；DXF 可直接预览。",
     )
     if st.button("批量上传", type="primary", disabled=not uploaded_files):
         if not uploaded_files:
@@ -362,15 +363,16 @@ def _render_manual_review_workbench(doc: Document, project: Project):
                 base_path = _annotated_image_output_path(doc.project_id, doc.id, current_image, selected_index)
                 manual_marker_path = base_path.with_name(base_path.stem + "_人工.png")
                 try:
-                    viewer_image, manual_marked = _build_manual_comment_marker_image(
-                        current_image, page_comments, manual_marker_path
+                    viewer_image, manual_marked = _cached_marker_image(
+                        current_image, page_comments, manual_marker_path,
+                        _build_manual_comment_marker_image,
                     )
                 except Exception:
                     viewer_image, manual_marked = current_image, 0
 
-            # key 随所选问题/标注开关变化，确保 iframe 重新挂载并执行定位脚本
-            focus_suffix = f"_{manual_focus_comment_id}" if manual_focus_comment_id else ""
-            viewer_key = f"manual_review_image_{doc.id}_{selected_index}{focus_suffix}_m{manual_marked}_{int(show_markers)}"
+            # 稳定的 viewer key：仅在图片或焦点目标实际变化时才改变
+            _focus_hash = hash(tuple(round(v, 4) for v in manual_focus_bbox)) if manual_focus_bbox else 0
+            viewer_key = f"manual_review_image_{doc.id}_{selected_index}_{Path(viewer_image).stem}_{_focus_hash}"
             _render_full_resolution_image(
                 viewer_image,
                 f"{page_title}图纸",

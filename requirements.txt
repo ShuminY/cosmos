@@ -18,6 +18,18 @@ pandas>=2.2
 pdf2image
 PyMuPDF>=1.24
 pytesseract
+ezdxf>=1.1  # DWG/DXF CAD 图纸解析
+matplotlib>=3.7  # ezdxf 渲染 DXF 为图片的后端（兜底用）
+
+# CAD DWG 预览外部依赖（必须安装）：
+#   ODA File Converter + LibreOffice
+#
+# macOS 安装方式：
+#   1. ODA File Converter: https://cad-manager-odafileconverter.com
+#      安装到 /Applications/ODAFileConverter.app（无空格版）
+#   2. LibreOffice: brew install --cask libreoffice 或官网下载
+#
+# 工作链路：DWG → (ODA) → DXF R12 → (LibreOffice) → PDF → (PyMuPDF) → PNG
 
 # OCR Support
 # poppler-utils (system)

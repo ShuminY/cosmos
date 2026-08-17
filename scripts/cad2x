@@ -1,0 +1,58 @@
+#!/bin/bash
+# cad2x 兼容 wrapper：用 dwg2SVG + cairosvg 实现 DWG → PDF 转换
+# 用法：cad2x -o OUTFILE INFILE  （OUTFILE 扩展名决定输出格式；当前仅支持 .pdf）
+
+set -e
+
+OUT=""
+IN=""
+
+# 简单参数解析（只关心 -o 和输入文件）
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) OUT="$2"; shift 2 ;;
+        --) shift; break ;;
+        -*) shift ;;        # 忽略其它未知参数（cad2x 兼容）
+        *)  IN="$1"; shift ;;
+    esac
+done
+
+if [[ -z "$IN" || -z "$OUT" ]]; then
+    echo "usage: cad2x -o OUTFILE INFILE" >&2
+    exit 2
+fi
+
+if [[ ! -f "$IN" ]]; then
+    echo "cad2x: input not found: $IN" >&2
+    exit 1
+fi
+
+EXT="${OUT##*.}"
+EXT_LOWER="$(echo "$EXT" | tr '[:upper:]' '[:lower:]')"
+
+# 当前仅实现 PDF 转换（cairosvg 后端）
+if [[ "$EXT_LOWER" != "pdf" ]]; then
+    echo "cad2x wrapper: only .pdf output is supported (requested: .$EXT_LOWER)" >&2
+    exit 3
+fi
+
+DWG2SVG="/usr/local/bin/dwg2SVG"
+if [[ ! -x "$DWG2SVG" ]]; then
+    echo "cad2x wrapper: dwg2SVG not found at $DWG2SVG" >&2
+    exit 4
+fi
+
+# 用 cosmos 环境的 Python 运行 cairosvg 模块（cairosvg 不在默认 PATH 上）
+CAIROSVG_PY="/Users/wangningkang/anaconda3/envs/cosmos/bin/python"
+if [[ ! -x "$CAIROSVG_PY" ]]; then
+    echo "cad2x wrapper: cosmos python not found at $CAIROSVG_PY" >&2
+    exit 4
+fi
+
+# DWG → SVG（stdout） → PDF
+"$DWG2SVG" "$IN" 2>/dev/null | "$CAIROSVG_PY" -m cairosvg -f pdf -o "$OUT" -
+
+if [[ ! -s "$OUT" ]]; then
+    echo "cad2x wrapper: conversion produced empty file" >&2
+    exit 5
+fi

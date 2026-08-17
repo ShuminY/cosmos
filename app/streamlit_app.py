@@ -44,6 +44,7 @@ from views import (
 from views_kb import view_knowledge_base, view_chatbot, view_chat_image, view_llm_settings
 from views_tasks import view_task_tracking
 from views_drawings import view_drawing_analysis
+from views_dwg2pdf import view_dwg2pdf
 from views_manual_review import view_manual_review
 from views_review_kb import view_review_knowledge_base
 from src.db import init_db
@@ -171,6 +172,7 @@ nav_groups = {
     "📝 人工审核": ["人工审核"],
     "📚 审图知识库": ["审图知识库"],
     "📐 图纸分析": ["图纸分析"],
+    "📐 DWG转PDF": ["DWG转PDF"],
     "💡 智能问答": ["知识库", "智能问答", "图片问答"],
     "🧪 Demo data": ["Overview", "Upload", "Visits", "World model", "Point Cloud", "Segments",
                      "Matches (HITL)", "References", "Change report"],
@@ -887,6 +889,7 @@ PAGES = {
     "Projects": view_projects,
     "Tasks": lambda: view_task_tracking(get_current_project()),
     "图纸分析": lambda: view_drawing_analysis(get_current_project()),
+    "DWG转PDF": lambda: view_dwg2pdf(get_current_project()),
     "人工审核": lambda: view_manual_review(get_current_project()),
     "审图知识库": view_review_knowledge_base,
     "Profile": view_profile,
