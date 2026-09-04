@@ -1,0 +1,23 @@
+# 版本控制 / IDE
+.git
+.idea
+.vscode
+.claude
+.DS_Store
+
+# 本地虚拟环境与缓存
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+*.egg-info
+
+# 运行时数据（由 docker-compose 挂载，或容器内 mkdir 创建）
+data
+outputs
+projects
+
+# 日志与临时文件
+*.log
+*.tmp
