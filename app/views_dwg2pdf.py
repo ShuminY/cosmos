@@ -54,222 +54,34 @@ except ImportError:
 # DXF 缓存根目录：macOS 用户把 DWG 在 ODA GUI 里转出 DXF 后放在这里对应子目录
 DXF_CACHE_ROOT = Path("data") / "dwg_dxf_cache"
 
-# ---------- Jenkins DWG→PDF job 配置 ----------
-# 配置方式：环境变量
-#   JENKINS_URL      = https://jenkins.aleph-lop.com/
-#   JENKINS_USER     = jenkins
-#   JENKINS_TOKEN    = API Token
-#   JENKINS_JOB_URL  = https://jenkins.aleph-lop.com/job/build/job/dwg2pdf/
-#   JENKINS_DWG_PARAM = downLoadPath
-# 全部配置后 Linux 主路径优先走 Jenkins job（触发 → 轮询 → 读源目录下的 zip → 解压）
-JENKINS_URL = os.environ.get("JENKINS_URL", "").rstrip("/")
-JENKINS_USER = os.environ.get("JENKINS_USER", "")
-JENKINS_TOKEN = os.environ.get("JENKINS_TOKEN", "")
-JENKINS_JOB_URL = os.environ.get("JENKINS_JOB_URL", "").rstrip("/")
-JENKINS_DWG_PARAM = os.environ.get("JENKINS_DWG_PARAM", "downLoadPath")
-JENKINS_POLL_INTERVAL = int(os.environ.get("JENKINS_POLL_INTERVAL", "10"))
-JENKINS_TIMEOUT = int(os.environ.get("JENKINS_TIMEOUT", "600"))
+# ---------- Jenkins DWG→PDF job ----------
+# 通用逻辑抽到 src.jenkins_dwg2pdf 模块，供 views_dwg2pdf / views_drawings 等复用。
+# 配置通过环境变量 JENKINS_URL / JENKINS_USER / JENKINS_TOKEN / JENKINS_JOB_URL 控制。
+try:
+    from src import jenkins_dwg2pdf as _jd
+    _JENKINS_AVAILABLE = _jd.available()
+except Exception:
+    _jd = None  # type: ignore
+    _JENKINS_AVAILABLE = False
 
 def _jenkins_available() -> bool:
-    """Jenkins 配置齐全且非 macOS 时可用."""
-    return (
-        bool(JENKINS_URL and JENKINS_USER and JENKINS_TOKEN and JENKINS_JOB_URL)
-        and not _is_macos()
-    )
-
-# 全局 Opener（带 cookie jar），保证 crumb 和 session 一致
-_JENKINS_OPENER = None
-_JENKINS_CRUMB: tuple[str, str] | None = None
-
-def _jenkins_opener():
-    """返回带 Basic auth + cookie jar 的 opener，延迟初始化."""
-    global _JENKINS_OPENER
-    if _JENKINS_OPENER:
-        return _JENKINS_OPENER
-    cj = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-    auth = base64.b64encode(f"{JENKINS_USER}:{JENKINS_TOKEN}".encode()).decode()
-    opener.addheaders = [("Authorization", f"Basic {auth}")]
-    _JENKINS_OPENER = opener
-    return _JENKINS_OPENER
-
-def _jenkins_request(path: str, method: str = "GET", data: bytes | None = None,
-                    extra_headers: dict | None = None) -> tuple[int, bytes]:
-    """发一次 Jenkins API 请求，返回 (status, body)."""
-    url = f"{JENKINS_URL}{path}" if path.startswith("/") else path
-    req = urllib.request.Request(url, data=data, method=method)
-    if data is not None:
-        req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    if extra_headers:
-        for k, v in extra_headers.items():
-            req.add_header(k, v)
-    try:
-        with _jenkins_opener().open(req, timeout=30) as resp:
-            return resp.status, resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read() or b""
-    except Exception:
-        return 0, b""
-
-def _jenkins_crumb() -> tuple[str, str] | None:
-    """获取 CSRF crumb（在同一个 session cookie 里），失败返回 None."""
-    global _JENKINS_CRUMB
-    if _JENKINS_CRUMB:
-        return _JENKINS_CRUMB
-    status, body = _jenkins_request("/crumbIssuer/api/json")
-    if status == 200 and body:
-        try:
-            data = json.loads(body)
-            name = data.get("crumbRequestField") or "Jenkins-Crumb"
-            value = data.get("crumb")
-            if value:
-                _JENKINS_CRUMB = (name, value)
-                return _JENKINS_CRUMB
-        except (json.JSONDecodeError, ValueError, KeyError):
-            pass
-    return None
-
-def _jenkins_trigger(dwg_path: str) -> bool:
-    """触发参数化构建，成功返回 True."""
-    # 先拿 crumb（建立 session cookie，同一 opener 内）
-    crumb = _jenkins_crumb()
-    body = urllib.parse.urlencode({JENKINS_DWG_PARAM: dwg_path}).encode()
-    headers = {}
-    if crumb:
-        headers[crumb[0]] = crumb[1]
-    status, resp_body = _jenkins_request(
-        f"{JENKINS_JOB_URL}/buildWithParameters",
-        method="POST", data=body, extra_headers=headers,
-    )
-    if status == 403:
-        # crumb 失效，清空后重取再试一次
-        global _JENKINS_CRUMB, _JENKINS_OPENER
-        _JENKINS_CRUMB = None
-        _JENKINS_OPENER = None
-        crumb = _jenkins_crumb()
-        if crumb:
-            headers2 = {crumb[0]: crumb[1]}
-            status, resp_body = _jenkins_request(
-                f"{JENKINS_JOB_URL}/buildWithParameters",
-                method="POST", data=body, extra_headers=headers2,
-            )
-    return status in (200, 201)
-
-def _jenkins_last_build_number() -> int | None:
-    """获取 job 最近一次构建号（构建前调用一次作为基线）。"""
-    status, body = _jenkins_request(f"{JENKINS_JOB_URL}/api/json?tree=lastBuild[number]")
-    if status == 200 and body:
-        try:
-            data = json.loads(body)
-            lb = data.get("lastBuild")
-            if lb and "number" in lb:
-                return int(lb["number"])
-        except (json.JSONDecodeError, ValueError, KeyError):
-            pass
-    return None
-
-def _jenkins_wait_build(baseline_number: int) -> tuple[str, str]:
-    """等待一次新构建完成，返回 (status, console_tail)。
-    status: SUCCESS / FAILURE / ABORTED / TIMEOUT / ERROR
-    """
-    deadline = time.time() + JENKINS_TIMEOUT
-    build_num: int | None = None
-    while time.time() < deadline:
-        # 找到基线之后的第一次构建
-        if build_num is None:
-            status, body = _jenkins_request(
-                f"{JENKINS_JOB_URL}/api/json?tree=lastBuild[number,building,result]"
-            )
-            if status == 200 and body:
-                try:
-                    lb = json.loads(body).get("lastBuild") or {}
-                    num = int(lb.get("number") or 0)
-                    if num > baseline_number:
-                        build_num = num
-                except (json.JSONDecodeError, ValueError, KeyError):
-                    pass
-            if build_num is None:
-                time.sleep(JENKINS_POLL_INTERVAL)
-                continue
-        # 轮询构建是否完成
-        status, body = _jenkins_request(
-            f"{JENKINS_JOB_URL}/{build_num}/api/json?tree=building,result"
-        )
-        if status == 200 and body:
-            try:
-                info = json.loads(body)
-                if info.get("building"):
-                    time.sleep(JENKINS_POLL_INTERVAL)
-                    continue
-                result = str(info.get("result") or "UNKNOWN")
-                # 取末尾 200 行 console
-                _, tail = _jenkins_request(
-                    f"{JENKINS_JOB_URL}/{build_num}/logText/progressiveText?start=0"
-                )
-                tail_text = tail.decode("utf-8", errors="replace")[-3000:]
-                return result, tail_text
-            except (json.JSONDecodeError, ValueError, KeyError):
-                pass
-        time.sleep(JENKINS_POLL_INTERVAL)
-    return "TIMEOUT", ""
+    return bool(_JENKINS_AVAILABLE and not _is_macos())
 
 def _convert_dwg_to_pdf_via_jenkins(dwg_path: Path, pdf_out: Path) -> tuple[bool, str]:
-    """触发 Jenkins dwg2pdf job 转换，job 完成后从源目录下载 zip 并解压出 PDF。
-
-    约定：job 跑完后会在 dwg 源目录下生成同名 .zip（内含各布局 PDF）。
-    我们把 zip 解压到 pdf_out 的同目录，然后把找到的第一个 PDF 重命名到 pdf_out。
-    """
-    src_dir = str(dwg_path.parent)
-    basename = dwg_path.stem  # 不含扩展名
-    zip_name = f"{basename}.zip"
-    zip_remote_path = f"{src_dir}/{zip_name}"
-
-    # 构建前基线：先删掉可能存在的旧 zip（避免把上次的当作这次的）
-    # 注意：服务器上是同一进程跑的，文件删了不影响；但如果 Jenkins 还没开始，我们这里直接读旧的就错
-    # 策略：记基线构建号，等构建号 > 基线
-    baseline = _jenkins_last_build_number() or 0
-
-    if not _jenkins_trigger(str(dwg_path)):
-        return False, "Jenkins 构建触发失败（403/网络错误）"
-    # 靠 lastBuild + baseline 等结果
-    result, tail = _jenkins_wait_build(baseline)
-    if result != "SUCCESS":
-        return False, f"Jenkins 构建结果: {result}\n{tail}"
-
-    # 构建成功 → 从源目录读 zip（直接用路径读，因为项目运行在同一台机器上 / 同挂载卷）
-    zip_path = Path(zip_remote_path)
-    if not zip_path.exists():
-        # 如果不是同机/非同盘，scp 也可以；这里先假设源目录可直接访问
-        # （cosmos 服务器就是 Jenkins job 的 lop 服务器）
-        return False, f"构建成功但没找到 zip: {zip_remote_path}\n{tail}"
-
-    # 解压到 pdf_out 所在目录
-    out_dir = pdf_out.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(str(out_dir))
-    except zipfile.BadZipFile as e:
-        return False, f"zip 解压失败: {e}"
-
-    # 找解压出的 PDF（可能是 <图纸名>_<布局名>.pdf，取第一个或合并？按需求：源目录下生成的 pdf zip）
-    # 约定：zip 里就是各布局的 PDF，我们把第一个作为主 PDF 输出
-    pdf_files = sorted(out_dir.glob(f"{basename}*.pdf"))
-    if not pdf_files:
-        pdf_files = sorted(out_dir.glob("*.pdf"))
-    if not pdf_files:
-        return False, "zip 里没有 PDF 文件"
-
-    # 把第一个 PDF 重命名到目标路径
-    first = pdf_files[0]
-    if first != pdf_out:
-        shutil.move(str(first), str(pdf_out))
-    # 清理其它 PDF（避免和旧文件混淆）
-    for f in pdf_files[1:]:
-        if f.exists():
-            f.unlink()
-
+    """走 Jenkins dwg2pdf job 转换，完成后从源目录读 zip 并解压到 pdf_out."""
+    if not _jd:
+        return False, "Jenkins 模块未加载"
+    pdf_path, err = _jd.convert_and_unzip(dwg_path, pdf_out.parent)
+    if pdf_path is None:
+        return False, err
+    if pdf_path != pdf_out:
+        try:
+            shutil.copy2(str(pdf_path), str(pdf_out))
+        except Exception as e:
+            return False, f"PDF 重命名失败: {e}"
     return True, ""
+
+
 
 
 def _user_id() -> int | None:
@@ -1737,13 +1549,13 @@ def _render_pdf_preview(project_id: int, doc: Document):
             use_container_width=True,
         )
 
-    if st.button("🔄 重新生成 PDF（清缓存重转，下游预览/切片会一起重算）",
+    if st.button("🔄 重新生成 PDF（清缓存重转，下游预览一起重算）",
                  key=f"regen_pdf_{doc.id}"):
         out_dir = _dwg2pdf_dir(project_id, doc.id)
         cached_pdf = out_dir / f"{dwg_path.stem}.pdf"
         if cached_pdf.exists():
             cached_pdf.unlink()
-        for sub in ("pages", "previews", "crops", "svgs"):
+        for sub in ("pages", "previews"):
             d = out_dir / sub
             if d.exists():
                 shutil.rmtree(d)
@@ -1771,102 +1583,6 @@ def _render_pdf_preview(project_id: int, doc: Document):
     preview_path = previews[page_number - 1]
     _render_panzoom_iframe(preview_path, key=f"pz_{doc.id}_{page_number}")
 
-    # SVG 矢量下载（直接从 DXF 渲染，每 layout 一张；B&W）
-    st.divider()
-    st.subheader("📐 SVG 矢量下载（黑白，多 sheet）")
-    st.caption("直接从 DXF 渲染：每个 layout 一张 SVG，黑白配色，矢量精度任意缩放不模糊。"
-               "文字以 path 形式输出（保证所有浏览器/编辑器一致显示），VIEWPORT 已过滤避免单张卡 10+ 分钟。")
-    # 优先用 ODA 转好的 DXF（在 dxf 缓存目录里），其次用 macOS 手动缓存目录，
-    # 都没有的话直接报错——不要拿 PDF 假装是 DXF 喂给 ezdxf。
-    out_dir = _dwg2pdf_dir(project_id, doc.id)
-    dxf_path = out_dir / f"{Path(doc.filename).stem}.dxf"
-    if not (dxf_path.exists() and dxf_path.stat().st_size > 0):
-        cached = _find_cached_dxf(doc)
-        if cached is not None:
-            dxf_path = cached
-    if not (dxf_path.exists() and dxf_path.stat().st_size > 0):
-        st.warning(f"找不到 DXF 文件（{dxf_path}），无法渲染 SVG。")
-    else:
-        svg_dir = out_dir / "svgs"
-        if st.button("🔄 重新生成 SVG（清缓存重渲）", key=f"regen_svg_{doc.id}"):
-            if svg_dir.exists():
-                shutil.rmtree(svg_dir)
-            st.rerun()
-        with st.spinner("正在从 DXF 渲染 SVG（大图单 sheet 较慢，3 并发；命中缓存秒返）..."):
-            svgs, svg_err = _convert_dxf_to_svg(dxf_path, svg_dir)
-        if svg_err:
-            st.warning(svg_err)
-        else:
-            for svg_path in svgs:
-                size_mb = svg_path.stat().st_size / 1024 / 1024
-                st.download_button(
-                    label=f"⬇️ 下载 {svg_path.name}（{size_mb:.1f}MB）",
-                    data=svg_path.read_bytes(),
-                    file_name=svg_path.name,
-                    mime="image/svg+xml",
-                    key=f"download_svg_{doc.id}_{svg_path.stem}",
-                )
-            if len(svgs) > 1:
-                zip_buf = io.BytesIO()
-                with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for svg_path in svgs:
-                        zf.write(svg_path, svg_path.name)
-                st.download_button(
-                    label=f"📦 打包下载全部 SVG (zip, {sum(p.stat().st_size for p in svgs)/1024/1024:.1f}MB)",
-                    data=zip_buf.getvalue(),
-                    file_name=f"{Path(doc.filename).stem}_svg.zip",
-                    mime="application/zip",
-                    key=f"download_svg_zip_{doc.id}",
-                )
-
-    # 按内容自动切分：墨迹连通的合并为一个长方形，空白剔除
-    st.divider()
-    st.subheader("✂️ 内容切分图片")
-    output_dir = _dwg2pdf_dir(project_id, doc.id) / "crops"
-    if st.button("🔄 重新切分", key=f"regen_auto_{doc.id}"):
-        for f in list(output_dir.glob("auto_*.png")) + list(output_dir.glob("grid_*.png")) + list(output_dir.glob("crop_*.png")):
-            f.unlink()
-        st.rerun()
-
-    with st.spinner("正在按内容切分图片..."):
-        crops, crop_err = _split_pdf_to_content_images(pdf_path, project_id, doc)
-
-    if crop_err:
-        st.warning(crop_err)
-        return
-
-    st.caption(f"共 {len(crops)} 张内容切片（已按墨迹连通性自动合并相邻图样、剔除空白），每张从矢量 PDF 按 150dpi 渲染")
-    col_dl1, col_dl2 = st.columns(2)
-    with col_dl1:
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for crop_path in crops:
-                zf.write(crop_path, crop_path.name)
-        st.download_button(
-            label="⬇️ 打包下载全部切片 (zip)",
-            data=zip_buffer.getvalue(),
-            file_name=f"{Path(doc.filename).stem}_切片.zip",
-            mime="application/zip",
-            key=f"download_crops_zip_{doc.id}",
-            use_container_width=True,
-        )
-    with col_dl2:
-        combined_pdf, pdf_err = _build_crops_pdf(crops, output_dir / "all_crops.pdf")
-        if pdf_err:
-            st.warning(pdf_err)
-        else:
-            st.download_button(
-                label="📄 下载合并 PDF（按顺序每图一页）",
-                data=combined_pdf.read_bytes(),
-                file_name=f"{Path(doc.filename).stem}_切片.pdf",
-                mime="application/pdf",
-                key=f"download_crops_pdf_{doc.id}",
-                use_container_width=True,
-            )
-    cols = st.columns(3)
-    for i, crop_path in enumerate(crops):
-        with cols[i % 3]:
-            st.image(str(crop_path), use_container_width=True, caption=crop_path.stem)
 
 
 def _render_platform_help():
@@ -1943,7 +1659,7 @@ def view_dwg2pdf(project: Project | None):
         f"项目: {project.name} · 上传 DWG → 转换 PDF → 页面预览；原始 DWG 仅供下载。"
     )
 
-    with st.expander("ℹ️ 转换流程说明", expanded=True):
+    with st.expander("ℹ️ 转换流程说明", expanded=False):
         st.markdown("\n".join(_render_platform_help()))
         if _is_macos():
             st.code(str(DXF_CACHE_ROOT.resolve()), language="text")

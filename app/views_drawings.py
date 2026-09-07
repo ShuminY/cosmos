@@ -246,6 +246,44 @@ def _prepare_drawing_images(doc: Document, project_id: int) -> tuple[list[Path],
     return [], f"暂不支持该图纸格式: {suffix or '未知'}"
 
 
+def _convert_dwg_via_jenkins(file_path: Path, out_dir: Path) -> tuple[list[Path], str | None]:
+    """走 Jenkins dwg2pdf job 转 DWG → PDF → PNG（返回 PNG 路径列表）。
+
+    失败时返回 ([], 错误信息)；未配置 Jenkins 也返回 ([], "") 让上层走下一个方案。
+    """
+    try:
+        from src import jenkins_dwg2pdf as _jd
+    except Exception:
+        return [], ""
+    if not _jd.available() or not PYMUPDF_AVAILABLE:
+        return [], ""
+
+    # 触发 + 等待构建
+    pdf_path, err = _jd.convert_and_unzip(file_path, out_dir)
+    if pdf_path is None or not pdf_path.exists():
+        return [], f"Jenkins 转换失败：{err or '未生成 PDF'}"
+
+    # PyMuPDF 拆 PNG（与 ODA+LO 路径一致，150dpi，page_NNN.png）
+    try:
+        import fitz as _fitz
+        pdf = _fitz.open(str(pdf_path))
+        image_paths = []
+        try:
+            for i in range(pdf.page_count):
+                page = pdf.load_page(i)
+                pix = page.get_pixmap(dpi=150)
+                out_path = out_dir / f"page_{i + 1:03d}.png"
+                pix.save(str(out_path))
+                image_paths.append(out_path)
+        finally:
+            pdf.close()
+        if not image_paths:
+            return [], "PDF 拆页后未生成图片"
+        return image_paths, None
+    except Exception as e:
+        return [], f"Jenkins PDF 拆页异常: {e}"
+
+
 def _convert_dwg_to_images(file_path: Path, project_id: int, doc_id: int) -> tuple[list[Path], str | None]:
     """将 DWG/DXF 图纸转换为 PNG 预览图。
 
@@ -268,6 +306,11 @@ def _convert_dwg_to_images(file_path: Path, project_id: int, doc_id: int) -> tup
 
     # ============= DWG =============
     if suffix == ".dwg":
+        # 方案 0：Jenkins dwg2pdf job（质量最好，需配置 JENKINS_* 环境变量）
+        jpg_result = _convert_dwg_via_jenkins(file_path, out_dir)
+        if jpg_result[0]:
+            return jpg_result
+
         # 方案 1：ODA + LibreOffice（最优组合，唯一可处理真实图纸）
         if oda and lo:
             return _convert_dwg_via_oda_and_lo(file_path, out_dir, oda, lo)
