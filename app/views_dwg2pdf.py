@@ -1887,31 +1887,49 @@ def _render_platform_help():
             "",
             "**DXF 缓存目录（统一放这里）**：",
         ]
+    lines = [f"**当前平台：{platform.system()}**", ""]
+
+    if _jenkins_available():
+        lines += [
+            "✅ Jenkins dwg2pdf job 已启用（质量接近 CAD 原生效果）",
+            "",
+        ]
+
     oda_cli = _find_oda_cli()
     if oda_cli:
-        return [
-            f"**当前平台：{platform.system()}**",
-            "",
+        lines += [
             f"✅ 已找到 ODA File Converter CLI：`{oda_cli}`",
             "",
-            "上传 DWG 后会自动：",
-            "1. ODA CLI：DWG → DXF（保留完整工程图）",
-            "2. ezdxf 渲染：DXF → 多页 PDF（每张图纸真实尺寸）",
-            "3. PyMuPDF 拆页：PDF → PNG 预览",
+        ]
+
+    if _jenkins_available() or oda_cli:
+        lines += [
+            "上传 DWG 后会自动（按优先级）：",
+        ]
+        steps = []
+        if _jenkins_available():
+            steps.append("1. Jenkins dwg2pdf job：GUI 自动化转换 → 打包 zip 回传（质量最好）")
+        if oda_cli:
+            steps.append(f"{len(steps)+1}. ODA CLI + ezdxf：DWG → DXF → 多页 PDF（本地兜底）")
+        steps.append(f"{len(steps)+1}. PyMuPDF 拆页：PDF → PNG 预览")
+        lines += steps
+        lines += [
             "",
             "**完全自动，无需手动操作。**",
         ]
-    return [
-        f"**当前平台：{platform.system()}**",
-        "",
-        "未找到 ODA File Converter CLI，转换可能失败。",
-        "",
-        "安装方法：",
-        "- 下载 ODA File Converter（Linux/Windows 版）放到 `/usr/bin/ODAFileConverter`",
-        "- 或设置环境变量 `ODA_CLI_BIN` 指向它",
-        "",
-        "然后重启应用即可全自动转换。",
-    ]
+    else:
+        lines += [
+            "未找到 ODA File Converter CLI，也未配置 Jenkins，转换可能失败。",
+            "",
+            "启用方式（任选一种）：",
+            "- 配置 `JENKINS_URL / JENKINS_USER / JENKINS_TOKEN / JENKINS_JOB_URL` 环境变量走 Jenkins job",
+            "- 下载 ODA File Converter（Linux/Windows 版）放到 `/usr/bin/ODAFileConverter`",
+            "- 或设置环境变量 `ODA_CLI_BIN` 指向它",
+            "",
+            "然后重启应用即可全自动转换。",
+        ]
+
+    return lines
 
 
 def view_dwg2pdf(project: Project | None):
