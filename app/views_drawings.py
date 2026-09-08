@@ -788,6 +788,25 @@ def _convert_dwg_via_oda_and_lo(file_path: Path, out_dir: Path,
 _SHEET_CODE_PATTERN = re.compile(
     r"\b([A-Z]{1,3}\d{0,2}[\-\s]?\d{1,3})\b"
 )
+# 值整体匹配：字母+数字，或纯数字 2~4 位（如 001）
+_SHEET_CODE_ALPHA_FULL = re.compile(r"^[A-Za-z]{1,4}-?\d{1,3}[A-Za-z]?$")
+_SHEET_CODE_NUMERIC_FULL = re.compile(r"^\d{2,4}$")
+_PDF_CODE_LABELS = ("图号", "图纸编号", "图别", "DRAWINGNO")
+
+
+def _clean_sheet_code(text: str, allow_numeric: bool = True) -> str:
+    """把文本规整成图号；不像图号返回空串。纯数字仅 allow_numeric 时接受。"""
+    t = re.sub(r"\s+", "", text).strip().upper().lstrip(":：")
+    if not t or len(t) > 10 or re.search(r"[:/@.]", t):
+        return ""
+    if _SHEET_CODE_ALPHA_FULL.match(t):
+        return t
+    if allow_numeric and _SHEET_CODE_NUMERIC_FULL.match(t):
+        # 4 位数字大概率是年份（2024）
+        if len(t) == 4 and t.startswith(("19", "20")):
+            return ""
+        return t
+    return ""
 
 
 def _extract_pdf_sheet_codes(pdf_path: Path) -> list[str]:
@@ -795,6 +814,10 @@ def _extract_pdf_sheet_codes(pdf_path: Path) -> list[str]:
 
     只依赖 PyMuPDF；PDF 中文名常有字体映射问题会读成乱码，所以图名不在这里抓，
     另外交由视觉 LLM 处理。
+
+    提取策略：先找"图号/图纸编号/DRAWING NO"标签，取其下方或右侧单元格的值
+    （支持纯数字图号如 001）；找不到标签再退回整页正则打分（只收字母+数字，
+    避免误吃尺寸标注和日期）。
     """
     if not PYMUPDF_AVAILABLE:
         return []
@@ -808,37 +831,95 @@ def _extract_pdf_sheet_codes(pdf_path: Path) -> list[str]:
         for page_index in range(pdf_doc.page_count):
             page = pdf_doc.load_page(page_index)
             w, h = page.rect.width, page.rect.height
-            code = ""
-            best_score = -1.0
             try:
                 text_dict = page.get_text("dict")
             except Exception:
                 results.append("")
                 continue
 
+            # 收集文本 span（bbox + 文本），标题栏一般在右半侧
+            spans = []
             for block in text_dict.get("blocks", []):
                 if block.get("type") != 0:
                     continue
-                x0, y0, x1, y1 = block["bbox"]
-                cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-                # 图号一般在页面右侧（右中或右下）；只搜索右半侧
-                if cx < w * 0.55:
-                    continue
-                text = "".join(
-                    span["text"]
-                    for line in block.get("lines", [])
-                    for span in line.get("spans", [])
-                ).strip()
-                if not text:
-                    continue
-                for match in _SHEET_CODE_PATTERN.finditer(text):
-                    candidate = match.group(1).replace(" ", "").replace("-", "-").upper()
-                    # 得分：越靠右越高 + 单元格短（长文本里含相似模式的概率高）
-                    # 图号不一定在最下面，所以 y 只做小幅加权（偏下略优）
-                    score = (cx / w) * 1.5 + (cy / h) * 0.3 - min(1.0, len(text) / 40)
-                    if score > best_score:
-                        best_score = score
-                        code = candidate
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = str(span.get("text", "")).strip()
+                        if not text:
+                            continue
+                        x0, y0, x1, y1 = span["bbox"]
+                        spans.append({
+                            "text": text,
+                            "norm": re.sub(r"\s+", "", text).upper(),
+                            "bbox": (x0, y0, x1, y1),
+                        })
+
+            code = ""
+
+            # 1) 标签锚定：值在标签下方（竖排单元格）或右侧（横排单元格）。
+            # 目录/材料表页里也有"图纸编号"列表头，所以从最靠下的标签开始找
+            # （标题栏标签总在页面底部区域），且限定在右半侧。
+            label_spans = [
+                sp for sp in spans
+                if any(lab in sp["norm"] for lab in _PDF_CODE_LABELS)
+                and (sp["bbox"][0] + sp["bbox"][2]) / 2 > w * 0.55
+            ]
+            label_spans.sort(key=lambda sp: sp["bbox"][1], reverse=True)
+            for label_span in label_spans:
+                lx0, ly0, lx1, ly1 = label_span["bbox"]
+                lw = max(lx1 - lx0, 1.0)
+                lh = max(ly1 - ly0, 4.0)
+                # 同一标签行上标签右侧的候选 + 标签下方的候选
+                candidates = []
+                for sp in spans:
+                    if sp is label_span:
+                        continue
+                    x0, y0, x1, y1 = sp["bbox"]
+                    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                    c = _clean_sheet_code(sp["text"])
+                    if not c:
+                        continue
+                    below = (ly1 - 0.3 * lh < cy < ly1 + 8 * lh
+                             and lx0 - 1.5 * lw <= cx <= lx1 + 1.5 * lw)
+                    right = (abs(cy - (ly0 + ly1) / 2) < lh
+                             and x0 >= lx1 - 2)
+                    if below or right:
+                        candidates.append((y0 if below else 0, x0, c))
+                if candidates:
+                    candidates.sort()
+                    code = candidates[0][2]
+                    break
+
+            # 2) 兜底：右半侧正则打分（只收字母+数字）。
+            # 目录/材料表这类"一页里有很多图号"的页面打分必然误中表内条目，
+            # 此时宁可放空交给 OCR/视觉模型，也不要写入错误图号。
+            if not code:
+                best_score = -1.0
+                distinct: set[str] = set()
+                for sp in spans:
+                    x0, y0, x1, y1 = sp["bbox"]
+                    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                    if cx < w * 0.55:
+                        continue
+                    text = sp["text"]
+                    # 跳过比例/图幅（"1:40@A2" 里的 A2 不是图号）
+                    if "@" in text or re.search(r"\d\s*[:：]\s*\d", text):
+                        continue
+                    if "比例" in text or "SCALE" in sp["norm"]:
+                        continue
+                    for match in _SHEET_CODE_PATTERN.finditer(text):
+                        candidate = _clean_sheet_code(match.group(1), allow_numeric=False)
+                        if not candidate:
+                            continue
+                        distinct.add(candidate)
+                        # 得分：越靠右越高 + 单元格短（长文本里含相似模式的概率高）
+                        # 图号不一定在最下面，所以 y 只做小幅加权（偏下略优）
+                        score = (cx / w) * 1.5 + (cy / h) * 0.3 - min(1.0, len(text) / 40)
+                        if score > best_score:
+                            best_score = score
+                            code = candidate
+                if len(distinct) >= 3:
+                    code = ""
             results.append(code)
     finally:
         pdf_doc.close()
@@ -965,17 +1046,20 @@ def _save_page_labels(doc_id: int, labels: list[dict]):
         s.commit()
 
 
-def _extract_labels_via_ocr(image_paths: list[Path]) -> list[dict]:
+def _extract_labels_via_ocr(image_paths: list[Path]) -> tuple[list[dict], str | None]:
     """用 RapidOCR 从每页图纸右侧区域提取图名/图号。
 
     通过子进程调用 ocr_worker.py，避免 onnxruntime/numpy 版本不兼容
     （AttributeError: _ARRAY_API not found）崩掉 Streamlit 主进程。
     子进程崩溃、超时、输出异常都返回空结果，走 PDF 文本层 + 视觉模型兜底。
 
-    返回长度==len(image_paths) 的 dict 列表，每项 {"title": str, "code": str}。
+    返回 (labels, error)：labels 是长度==len(image_paths) 的 dict 列表
+    （每项 {"title": str, "code": str}）；error 为 None 表示子进程正常跑完，
+    否则是诊断信息（依赖缺失、超时、崩溃等），供界面提示。
     """
+    empty = [{"title": "", "code": ""} for _ in image_paths]
     if not image_paths:
-        return []
+        return [], None
 
     import sys as _sys
     import json as _json
@@ -983,9 +1067,13 @@ def _extract_labels_via_ocr(image_paths: list[Path]) -> list[dict]:
     # ocr_worker.py 在 src/ 下，与本文件 app/ 同级
     worker_script = Path(__file__).resolve().parent.parent / "src" / "ocr_worker.py"
     if not worker_script.exists():
-        return [{"title": "", "code": ""} for _ in image_paths]
+        return empty, "OCR worker 脚本缺失（src/ocr_worker.py）"
 
     timeout = max(60, len(image_paths) * 15)  # 每页最多 15 秒，保底 60 秒
+
+    def _stderr_tail(stderr: str, limit: int = 200) -> str:
+        lines = [ln for ln in (stderr or "").strip().splitlines() if ln.strip()]
+        return (lines[-1] if lines else "")[:limit]
 
     try:
         proc = subprocess.run(
@@ -994,11 +1082,21 @@ def _extract_labels_via_ocr(image_paths: list[Path]) -> list[dict]:
             text=True,
             timeout=timeout,
         )
+        if proc.returncode == 2:
+            # worker 明确报告依赖缺失
+            return empty, (
+                _stderr_tail(proc.stderr)
+                or "RapidOCR 依赖未安装（pip install rapidocr_onnxruntime）"
+            )
         if proc.returncode != 0 or not proc.stdout.strip():
-            return [{"title": "", "code": ""} for _ in image_paths]
-        results = _json.loads(proc.stdout)
+            tail = _stderr_tail(proc.stderr)
+            return empty, f"OCR 子进程失败（exit {proc.returncode}）{('：' + tail) if tail else ''}"
+        try:
+            results = _json.loads(proc.stdout)
+        except _json.JSONDecodeError:
+            return empty, "OCR 子进程输出无法解析"
         if not isinstance(results, list) or len(results) != len(image_paths):
-            return [{"title": "", "code": ""} for _ in image_paths]
+            return empty, "OCR 子进程返回结果数量与页数不符"
         # 规整化每项
         normalized = []
         for r in results:
@@ -1009,10 +1107,16 @@ def _extract_labels_via_ocr(image_paths: list[Path]) -> list[dict]:
                 })
             else:
                 normalized.append({"title": "", "code": ""})
-        return normalized
-    except Exception:
-        # 超时、子进程崩溃、JSON 解析失败等全部跳过
-        return [{"title": "", "code": ""} for _ in image_paths]
+        # 进程跑完但一页都没识别出来，把 worker 的页面级警告透传出来
+        warn = _stderr_tail(proc.stderr) if not any(
+            x["title"] or x["code"] for x in normalized
+        ) else None
+        return normalized, warn
+    except subprocess.TimeoutExpired:
+        return empty, f"OCR 超时（>{timeout}s）"
+    except Exception as e:
+        # 子进程崩溃等全部跳过
+        return empty, f"OCR 调用失败：{e}"
 
 
 def _ensure_page_labels(doc: Document, project_id: int, image_paths: list[Path],
@@ -1070,9 +1174,7 @@ def _ensure_page_labels(doc: Document, project_id: int, image_paths: list[Path],
     ocr_codes_before = sum(1 for x in labels if x["code"])
     ocr_err = None
     try:
-        ocr_labels = _extract_labels_via_ocr(image_paths)
-        if not ocr_labels:
-            ocr_err = "OCR 未返回结果（可能 onnxruntime/numpy 不兼容或子进程失败）"
+        ocr_labels, ocr_err = _extract_labels_via_ocr(image_paths)
     except Exception as e:
         ocr_labels = []
         ocr_err = str(e)
