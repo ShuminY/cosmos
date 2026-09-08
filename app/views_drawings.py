@@ -96,8 +96,14 @@ def _user_id() -> int | None:
     return user.get("id")
 
 
-def _save_uploaded_drawing(project_id: int, uploaded_file) -> int:
-    """保存新增分析页上传的图纸文件，并写入Document记录."""
+def _save_uploaded_drawing(project_id: int, uploaded_file,
+                            preprocess: bool = True) -> int:
+    """保存新增分析页上传的图纸文件，并写入Document记录.
+
+    对 DWG/DXF 文件，保存后会自动触发一次预处理（生成 PNG 预览，优先 Jenkins），
+    避免后面每个页面都重复触发转换。已有缓存时直接跳过。
+    preprocess=False 时只保存不预转换（批量上传时使用，避免串行等待太久）。
+    """
     target_dir = documents_dir(project_id, "03_drawings")
     dest = target_dir / uploaded_file.name
     if dest.exists():
@@ -120,7 +126,17 @@ def _save_uploaded_drawing(project_id: int, uploaded_file) -> int:
         s.flush()
         doc_id = doc.id
         s.commit()
-        return doc_id
+
+    if preprocess:
+        # DWG/DXF 上传后自动生成预览 PNG（有缓存就秒返）
+        suffix = dest.suffix.lower()
+        if suffix in (".dwg", ".dxf"):
+            try:
+                _prepare_drawing_images(doc, project_id)
+            except Exception:
+                pass  # 预处理失败不影响上传流程，预览时会再试
+
+    return doc_id
 
 
 def _extract_labels_after_upload(project_id: int, doc_id: int) -> tuple[int, str | None]:
@@ -218,6 +234,146 @@ def _convert_pdf_to_images(pdf_path: Path, project_id: int, doc_id: int) -> list
         return sorted(output_dir.glob("page_*.png"))
 
     raise RuntimeError("缺少PDF渲染依赖：请安装 PyMuPDF，或安装 pdf2image + Poppler")
+
+
+def _convert_dwg_to_pdf_file(file_path: Path, project_id: int,
+                              doc_id: int) -> tuple[Path | None, str | None]:
+    """DWG/DXF → PDF，返回 (pdf 路径, 错误信息).
+
+    优先级同 _convert_dwg_to_images：Jenkins → ODA+LibreOffice → ODA+ezdxf → LibreOffice
+    PDF 输出到 pdf_conversions/<doc_id>/ 目录，命名为 <原始文件名>.pdf。
+    """
+    suffix = file_path.suffix.lower()
+    out_dir = Path("data") / "projects" / str(project_id) / "pdf_conversions" / str(doc_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_out = out_dir / f"{file_path.stem}.pdf"
+
+    if suffix == ".pdf":
+        return file_path, None
+
+    # 已有缓存直接返回
+    if pdf_out.exists() and pdf_out.stat().st_size > 0:
+        return pdf_out, None
+
+    oda = _find_oda_converter()
+    lo = _find_libreoffice()
+
+    if suffix == ".dwg":
+        # 方案 0：Jenkins（质量最好，需配置 JENKINS_*）
+        try:
+            from src import jenkins_dwg2pdf as _jd
+            if _jd.available():
+                jpg_pdf, jerr = _jd.convert_and_unzip(file_path, out_dir)
+                if jpg_pdf and jpg_pdf.exists():
+                    if jpg_pdf != pdf_out:
+                        import shutil as _sh
+                        _sh.copy2(str(jpg_pdf), str(pdf_out))
+                    return pdf_out, None
+        except Exception:
+            pass
+
+        # 方案 1：ODA + LibreOffice
+        if oda and lo:
+            import tempfile, shutil as _sh
+            in_dir = Path(tempfile.mkdtemp())
+            dxf_dir = Path(tempfile.mkdtemp())
+            pdf_dir = Path(tempfile.mkdtemp())
+            try:
+                staged = in_dir / file_path.name
+                _sh.copy2(str(file_path), str(staged))
+                subprocess.run(
+                    [oda, str(in_dir), str(dxf_dir), "ACAD12", "DXF", "0", "1"],
+                    capture_output=True, text=True, timeout=480,
+                )
+                dxf_files = sorted(dxf_dir.glob("*.dxf"))
+                if dxf_files:
+                    subprocess.run(
+                        [lo, "--headless", "--convert-to", "pdf",
+                         "--outdir", str(pdf_dir), str(dxf_files[0])],
+                        capture_output=True, text=True, timeout=180,
+                    )
+                    pdfs = sorted(pdf_dir.glob("*.pdf"))
+                    if pdfs:
+                        _sh.copy2(str(pdfs[0]), str(pdf_out))
+                        return pdf_out, None
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                pass
+            finally:
+                _sh.rmtree(in_dir, ignore_errors=True)
+                _sh.rmtree(dxf_dir, ignore_errors=True)
+                _sh.rmtree(pdf_dir, ignore_errors=True)
+
+        # 方案 2：ODA + ezdxf
+        if oda and EZDXF_AVAILABLE:
+            paths, _ = _convert_dwg_via_oda(file_path, out_dir, oda)
+            if paths:
+                # ezdxf 转出来的是 PNG，但我们这里要 PDF；从 DXF→PDF 用 ezdxf
+                dxf_files = sorted(out_dir.glob("*.dxf"))
+                if dxf_files and EZDXF_AVAILABLE and PYMUPDF_AVAILABLE:
+                    try:
+                        # 复用 dxf→PDF 逻辑：调用 _dxf_to_pdf_via_ezdxf（如存在）
+                        if '_dxf_to_pdf_via_ezdxf' in globals():
+                            ok, _ = _dxf_to_pdf_via_ezdxf(dxf_files[0], pdf_out)
+                            if ok:
+                                return pdf_out, None
+                    except Exception:
+                        pass
+
+        # 方案 3：纯 LibreOffice
+        if lo:
+            import tempfile, shutil as _sh
+            pdf_dir = Path(tempfile.mkdtemp())
+            try:
+                subprocess.run(
+                    [lo, "--headless", "--convert-to", "pdf",
+                     "--outdir", str(pdf_dir), str(file_path)],
+                    capture_output=True, text=True, timeout=300,
+                )
+                pdfs = sorted(pdf_dir.glob("*.pdf"))
+                if pdfs:
+                    _sh.copy2(str(pdfs[0]), str(pdf_out))
+                    return pdf_out, None
+            except Exception:
+                pass
+            finally:
+                _sh.rmtree(pdf_dir, ignore_errors=True)
+
+        return None, "DWG→PDF 失败：没有可用的转换引擎"
+
+    if suffix == ".dxf":
+        # 方案 1：LibreOffice
+        if lo:
+            import tempfile, shutil as _sh
+            pdf_dir = Path(tempfile.mkdtemp())
+            try:
+                subprocess.run(
+                    [lo, "--headless", "--convert-to", "pdf",
+                     "--outdir", str(pdf_dir), str(file_path)],
+                    capture_output=True, text=True, timeout=300,
+                )
+                pdfs = sorted(pdf_dir.glob("*.pdf"))
+                if pdfs:
+                    _sh.copy2(str(pdfs[0]), str(pdf_out))
+                    return pdf_out, None
+            except Exception:
+                pass
+            finally:
+                _sh.rmtree(pdf_dir, ignore_errors=True)
+
+        # 方案 2：ezdxf
+        if EZDXF_AVAILABLE and PYMUPDF_AVAILABLE:
+            try:
+                if '_dxf_to_pdf_via_ezdxf' in globals():
+                    ok, _ = _dxf_to_pdf_via_ezdxf(file_path, pdf_out)
+                    if ok:
+                        return pdf_out, None
+            except Exception:
+                pass
+        return None, "DXF→PDF 失败：没有可用的转换引擎"
+
+    return None, f"不支持的格式: {suffix}"
 
 
 def _prepare_drawing_images(doc: Document, project_id: int) -> tuple[list[Path], str | None]:
@@ -1002,21 +1158,14 @@ def _display_preview(project_id: int, doc: Document, width: int = 240):
         conversion_dir = Path("data") / "projects" / str(project_id) / "pdf_conversions" / str(doc.id)
         pages = sorted(conversion_dir.glob("page_*.png"))
         if pages:
-            st.image(str(pages[0]), width=width, caption=f"CAD预览: {pages[0].name}")
+            st.image(str(pages[0]), width=width,
+                     caption=f"CAD预览: {pages[0].name} ({len(pages)} 页)")
         else:
-            # 没有预览就自动转换（优先 Jenkins，失败回退本地引擎）
             suffix = file_path.suffix.lower()
-            with st.spinner("正在生成预览图（首次稍长，约 1-3 分钟）..."):
-                gen_pages, err = _convert_dwg_to_images(file_path, project_id, doc.id)
-            if gen_pages:
-                st.image(str(gen_pages[0]), width=width,
-                         caption=f"CAD预览: {gen_pages[0].name} ({len(gen_pages)} 页)")
+            if suffix == ".dxf":
+                st.info("DXF 文件已上传，预览生成中...")
             else:
-                if suffix == ".dxf":
-                    st.info("DXF 文件已上传，预览生成失败。")
-                else:
-                    st.info(f"DWG 预览生成失败：{err or '未知原因'}\n\n"
-                            "文件已保存，可下载原文件。")
+                st.info("DWG 文件已上传，预览生成中（首次约 1-3 分钟，刷新页面即可查看）。")
         return
 
     st.info("该文件类型暂不支持预览")
@@ -4197,7 +4346,8 @@ def view_new_drawing_analysis(project: Project):
         )
         if st.button("上传并选择该图纸", type="primary", disabled=uploaded_file is None):
             with st.spinner("正在保存图纸文件..."):
-                doc_id = _save_uploaded_drawing(project.id, uploaded_file)
+                # 只保存不预转换，下面 _extract_labels_after_upload 会统一做预处理
+                doc_id = _save_uploaded_drawing(project.id, uploaded_file, preprocess=False)
             st.session_state["drawing_uploaded_selected_doc_id"] = doc_id
             with st.spinner("正在预处理并自动提取页面名称（图名+图号）..."):
                 named, err = _extract_labels_after_upload(project.id, doc_id)

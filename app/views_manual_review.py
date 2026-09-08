@@ -137,34 +137,48 @@ def _select_or_upload_doc(project: Project) -> Document | None:
         last_doc_id = None
         errors = []
 
-        with st.spinner(f"正在批量保存 {n_total} 个图纸文件..."):
-            for idx, uploaded_file in enumerate(uploaded_files, 1):
-                try:
-                    doc_id = _save_uploaded_drawing(project.id, uploaded_file)
-                    # 记录为人工审核对象，让它出现在历史列表
-                    _ensure_manual_review_record(doc_id)
-                    # 只对最后一个文件做页面名称提取预处理，避免批量上传耗时太长
-                    last_doc_id = doc_id
-                    n_ok += 1
-                except Exception as e:
-                    errors.append(f"{uploaded_file.name}: {str(e)}")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        for idx, uploaded_file in enumerate(uploaded_files, 1):
+            try:
+                status_text.text(
+                    f"正在处理 {idx}/{n_total}: {uploaded_file.name}"
+                )
+                # 先保存文件（不预转换）
+                doc_id = _save_uploaded_drawing(
+                    project.id, uploaded_file, preprocess=False
+                )
+                # 记录为人工审核对象
+                _ensure_manual_review_record(doc_id)
+
+                # DWG/DXF：转 PDF + 自动提图名
+                suffix = Path(uploaded_file.name).suffix.lower()
+                if suffix in (".dwg", ".dxf"):
+                    _extract_labels_after_upload(project.id, doc_id)
+
+                last_doc_id = doc_id
+                n_ok += 1
+            except Exception as e:
+                errors.append(f"{uploaded_file.name}: {str(e)}")
+            finally:
+                progress_bar.progress(idx / n_total)
+
+        progress_bar.empty()
 
         if last_doc_id:
             st.session_state["manual_review_uploaded_doc_id"] = last_doc_id
-            # 让「历史」页默认打开最后一张新图
             st.session_state["manual_history_selected_doc_id"] = last_doc_id
 
-            # 只对最后一个文件做自动提取，避免批量上传等待太久
-            with st.spinner("正在对最后一张图纸预处理并自动提取页面名称（图名+图号）..."):
-                named, err = _extract_labels_after_upload(project.id, last_doc_id)
-
-            # 汇总结果
             if errors:
                 st.error(f"批量上传完成：成功 {n_ok}/{n_total}，失败 {len(errors)}。")
                 for err_msg in errors:
                     st.error(f"- {err_msg}")
             else:
-                st.success(f"批量上传完成：成功 {n_ok}/{n_total}。已自动识别最后一张图纸的 {named} 页图名/图号。请到「人工审核列表」中继续批注。")
+                st.success(
+                    f"批量上传完成：成功 {n_ok}/{n_total}。"
+                    "DWG/DXF 已自动转 PDF 并提取图名/图号。"
+                    "请到「人工审核列表」中继续批注。"
+                )
         else:
             st.error("所有文件上传均失败，请检查后重试。")
 
@@ -692,7 +706,7 @@ def _render_manual_review_focus(doc: Document, project: Project):
     st.divider()
     st.subheader("⬇️ 导出")
     timestamp = format_beijing(doc.analyzed_at, '%Y%m%d_%H%M%S') if doc.analyzed_at else "export"
-    col_e1, col_e2 = st.columns(2)
+    col_e1, col_e2, col_e3 = st.columns(3)
     with col_e1:
         bundle_bytes, bundle_ext, bundle_mime = _export_manual_comments_bundle(doc, data)
         _is_zip = bundle_ext == "zip"
@@ -704,6 +718,7 @@ def _render_manual_review_focus(doc: Document, project: Project):
             key=f"manual_export_xlsx_{doc.id}",
             disabled=bundle_bytes is None,
             help="含文件附件时打包为 ZIP（Excel + 附件文件）" if _is_zip else (None if bundle_bytes else "暂无人工批注可导出"),
+            use_container_width=True,
         )
     with col_e2:
         if st.button(
@@ -721,7 +736,40 @@ def _render_manual_review_focus(doc: Document, project: Project):
                 file_name=f"{Path(doc.filename).stem}_人工审核批注_{timestamp}.pdf",
                 mime="application/pdf",
                 key=f"manual_download_pdf_{doc.id}",
+                use_container_width=True,
             )
+    with col_e3:
+        # 原始图纸 PDF（从 DWG 转换来的完整多页 PDF）
+        src_path = _doc_file_path(project.id, doc)
+        suffix = src_path.suffix.lower()
+        pdf_path = None
+        if suffix == ".pdf":
+            pdf_path = src_path
+        elif suffix in (".dwg", ".dxf"):
+            # 从 pdf_conversions 目录找
+            conv_dir = Path("data") / "projects" / str(project.id) / "pdf_conversions" / str(doc.id)
+            candidates = sorted(conv_dir.glob(f"{src_path.stem}*.pdf"))
+            if candidates:
+                pdf_path = candidates[0]
+        if pdf_path and pdf_path.exists():
+            page_count = 0
+            try:
+                import fitz as _fitz
+                pdf_doc = _fitz.open(str(pdf_path))
+                page_count = pdf_doc.page_count
+                pdf_doc.close()
+            except Exception:
+                pass
+            st.download_button(
+                label=f"📄 下载原始图纸 PDF（{page_count} 页）",
+                data=pdf_path.read_bytes(),
+                file_name=f"{Path(doc.filename).stem}.pdf",
+                mime="application/pdf",
+                key=f"manual_download_original_pdf_{doc.id}",
+                use_container_width=True,
+            )
+        else:
+            st.info("原始 PDF 尚未生成")
 
 
 def _default_selector_index(project: Project, target_doc_id: int) -> int:
