@@ -325,12 +325,17 @@ def convert_and_unzip(dwg_path: Path, output_dir: Path) -> tuple[Optional[Path],
     - 最近失败冷却期内（默认 30 分钟）直接跳过，避免连续失败产生一堆无用 job；
     - 用 queue item id 精确定位"自己触发的"那次构建，并发安全。
     """
+    # 统一转为绝对路径：Jenkins 端（及 zip 回传路径判定）必须用绝对路径，
+    # 否则相对路径（如 data/projects/...）在 Jenkins 工作目录下解析不到文件。
+    dwg_path = dwg_path.resolve()
+    output_dir = output_dir.resolve()
+
     src_dir = str(dwg_path.parent)
     basename = dwg_path.stem
     zip_name = f"{basename}.zip"
     zip_path = Path(src_dir) / zip_name
 
-    key = str(dwg_path.resolve())
+    key = str(dwg_path)
 
     # ---------- 0. 输出目录已有 PDF 就直接返回（上层也会判，但保险） ----------
     existing_pdf = _find_main_pdf(output_dir, basename)
@@ -402,6 +407,25 @@ def _shared_cached_pdf(dwg_path: Path) -> Optional[Path]:
     """共享缓存里是否已有该 DWG 对应的主 PDF."""
     cache = _shared_cache_dir(dwg_path)
     return _find_main_pdf(cache, dwg_path.stem)
+
+
+def clear_cache(dwg_path: Path) -> None:
+    """清除该 DWG 对应的 Jenkins 共享缓存（包括主 PDF、sheets/、失败标记）。
+
+    用于「重新生成」按钮，确保重新触发 Jenkins job 而不是命中旧缓存。
+    """
+    import shutil as _sh
+    dwg_path = dwg_path.resolve()
+    cache_dir = _shared_cache_dir(dwg_path)
+    if cache_dir.exists():
+        _sh.rmtree(cache_dir, ignore_errors=True)
+    # 同时清掉失败标记
+    marker = _failure_marker_path(dwg_path.parent, dwg_path.stem)
+    if marker.exists():
+        try:
+            marker.unlink()
+        except Exception:
+            pass
 
 
 def _do_convert_and_unzip(dwg_path: Path, output_dir: Path,

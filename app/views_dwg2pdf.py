@@ -1649,6 +1649,12 @@ def _render_pdf_preview(project_id: int, doc: Document):
         # 清掉旧 zip
         for z in out_dir.glob("*_sheets.zip"):
             z.unlink(missing_ok=True)
+        # 清掉 Jenkins 共享缓存（否则重新生成会命中旧缓存，没有 sheets/）
+        if _jd:
+            try:
+                _jd.clear_cache(dwg_path)
+            except Exception:
+                pass
         st.rerun()
 
     # ===== PDF 选择 + 页码选择 + 预览 =====

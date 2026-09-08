@@ -846,8 +846,10 @@ def _extract_page_titles_via_vision(image_paths: list[Path], provider: str | Non
         provider = get_default_provider()
     provider_config = load_provider_config(provider)
 
-    # 生成裁剪图；写到 pdf_conversions 附近的临时目录
+    # 生成裁剪图；先裁剪右侧标题栏区域，再压缩到最长边 2000px
+    # （标题栏文字识别不需要原图分辨率，压缩后既省内存又省 token，还能避免大图 base64 导致 OOM）
     crops: list[Path] = []
+    MAX_LONG_SIDE = 2000
     for src in image_paths:
         try:
             with Image.open(src) as img:
@@ -856,8 +858,16 @@ def _extract_page_titles_via_vision(image_paths: list[Path], provider: str | Non
                 # 可能在右下角也可能在右中部，窄条覆盖更全）
                 box = (int(w * 0.65), 0, w, h)
                 crop = img.convert("RGB").crop(box)
+                # 压缩到最长边 MAX_LONG_SIDE 以内
+                cw, ch = crop.size
+                long_side = max(cw, ch)
+                if long_side > MAX_LONG_SIDE:
+                    scale = MAX_LONG_SIDE / long_side
+                    new_w = max(1, int(cw * scale))
+                    new_h = max(1, int(ch * scale))
+                    crop = crop.resize((new_w, new_h), Image.LANCZOS)
                 crop_path = src.parent / f"__titleblock_{src.stem}.png"
-                crop.save(crop_path, format="PNG")
+                crop.save(crop_path, format="PNG", optimize=True)
                 crops.append(crop_path)
         except Exception:
             crops.append(src)  # 兜底：整页也行，只是 token 更多
@@ -974,6 +984,8 @@ def _extract_labels_via_ocr(image_paths: list[Path]) -> list[dict]:
     code_re = re.compile(r"\b([A-Za-z]{1,3}[- ]?\d{1,3})\b")
 
     results = []
+    # OCR 输入最长边上限：RapidOCR 内部会做缩放，太大了反而慢且占内存
+    OCR_MAX_LONG = 3000
     for src in image_paths:
         code = ""
         title = ""
@@ -986,8 +998,16 @@ def _extract_labels_via_ocr(image_paths: list[Path]) -> list[dict]:
                 # 但某些图的标题栏横跨右半侧上部，窄条会被裁掉）
                 box = (int(w * 0.65), 0, w, h)
                 crop = img.convert("RGB").crop(box)
-                # 放大 2 倍，小文字 OCR 效果好
-                crop = crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)
+                # 放大 2 倍，小文字 OCR 效果好；但最长边不超过 OCR_MAX_LONG
+                cw, ch = crop.size
+                scale = 2.0
+                long_side = max(cw, ch) * scale
+                if long_side > OCR_MAX_LONG:
+                    scale = OCR_MAX_LONG / max(cw, ch)
+                new_w = max(1, int(cw * scale))
+                new_h = max(1, int(ch * scale))
+                if new_w != cw or new_h != ch:
+                    crop = crop.resize((new_w, new_h), Image.LANCZOS)
                 img_arr = np.array(crop)
 
             ocr_result, _ = _OCR_ENGINE(img_arr)
