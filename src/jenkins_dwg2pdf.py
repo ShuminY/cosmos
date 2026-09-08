@@ -481,13 +481,23 @@ def _merge_pdfs(pdf_paths: list[Path], target: Path) -> Optional[Path]:
 
 
 def _copy_to_output(src_pdf: Path, output_dir: Path, basename: str) -> Optional[Path]:
-    """把共享缓存里的 PDF 拷到调用方指定的 output_dir，返回目标路径."""
+    """把共享缓存里的 PDF（以及 sheets/ 单页 PDF）拷到调用方指定的 output_dir，返回主 PDF 路径."""
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / f"{basename}.pdf"
     try:
+        import shutil
         if src_pdf.resolve() != target.resolve() and src_pdf.exists():
-            import shutil
             shutil.copy2(str(src_pdf), str(target))
+        # 同时复制 sheets/ 目录（所有单页 PDF）
+        src_sheets = src_pdf.parent / "sheets"
+        if src_sheets.exists() and src_sheets.is_dir():
+            dst_sheets = output_dir / "sheets"
+            dst_sheets.mkdir(parents=True, exist_ok=True)
+            for f in src_sheets.glob("*.pdf"):
+                if f.stat().st_size > 0:
+                    dst = dst_sheets / f.name
+                    if not dst.exists():
+                        shutil.copy2(str(f), str(dst))
     except Exception:
         # 拷失败至少返回源路径，调用方还能用
         return src_pdf
@@ -498,14 +508,16 @@ def _unzip_and_locate(zip_path: Path, output_dir: Path,
                       basename: str) -> Optional[Path]:
     """解压 zip，返回合并后的多页 PDF 路径。
 
-    Jenkins 出的 zip 里可能每个 layout 一个 PDF（共几十页），和 ezdxf 路径
-    的"单个多页 PDF"格式不一致。这里把所有 PDF 按文件名排序后合并成一个
-    <basename>.pdf，保证上层（页面预览 / PNG 拆页 / SVG 导出）不管走哪条
-    路径拿到的都是统一格式的多页 PDF。
+    Jenkins 出的 zip 里可能每个 layout 一个 PDF（共几十页）。
+    - 合并成一个 <basename>.pdf（保证上层 PNG 拆页 / SVG 导出等兼容）
+    - 同时把每个单页 PDF 保存到 sheets/ 子目录，供 UI 按张选择查看/下载
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    sheets_dir = output_dir / "sheets"
+    sheets_dir.mkdir(parents=True, exist_ok=True)
     try:
         import zipfile
+        import shutil
         with zipfile.ZipFile(str(zip_path), "r") as zf:
             zf.extractall(str(output_dir))
     except Exception:
@@ -514,10 +526,19 @@ def _unzip_and_locate(zip_path: Path, output_dir: Path,
     # 收集所有 PDF（递归，防止 zip 里多了一层目录）
     all_pdfs: list[Path] = []
     for p in sorted(output_dir.rglob("*.pdf"), key=lambda x: x.name):
-        if p.stat().st_size > 0:
+        if p.stat().st_size > 0 and p.parent != sheets_dir:
             all_pdfs.append(p)
     if not all_pdfs:
         return None
+
+    # 把每个单页 PDF 复制到 sheets/ 目录（保留原始文件名）
+    for idx, p in enumerate(all_pdfs, start=1):
+        target_sheet = sheets_dir / p.name
+        if p.resolve() != target_sheet.resolve():
+            try:
+                shutil.copy2(str(p), str(target_sheet))
+            except Exception:
+                pass
 
     target = output_dir / f"{basename}.pdf"
 
@@ -540,4 +561,4 @@ def _unzip_and_locate(zip_path: Path, output_dir: Path,
         except Exception:
             pass
     # 优先返回命名规范的那个
-    return target if target.exists() else main_pdf
+    return target if target.exists() else all_pdfs[0]

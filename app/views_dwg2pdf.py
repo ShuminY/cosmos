@@ -220,6 +220,7 @@ except ImportError:
     pass  # Windows 无 resource 模块
 
 dxf_path, pdf_path = sys.argv[1], sys.argv[2]
+sheets_dir = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 
 import os
 import re
@@ -749,6 +750,15 @@ for nm in layout_names:
         continue
     sub = pymupdf.open(stream=results[nm], filetype="pdf")
     pdf_doc.insert_pdf(sub)
+    # 同时把每页独立保存到 sheets/ 目录（用 layout 名作文件名）
+    if sheets_dir is not None:
+        try:
+            sheets_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = nm.replace('/', '_').replace(' ', '_')
+            sheet_path = sheets_dir / f"{safe_name}.pdf"
+            sub.save(str(sheet_path))
+        except Exception:
+            pass
     sub.close()
 pdf_doc.save(pdf_path)
 pdf_doc.close()
@@ -760,20 +770,27 @@ print(note)
 '''
 
 
-def _dxf_to_pdf_via_ezdxf(dxf_path: Path, pdf_path: Path) -> tuple[bool, str]:
+def _dxf_to_pdf_via_ezdxf(dxf_path: Path, pdf_path: Path,
+                           sheets_dir: Path | None = None) -> tuple[bool, str]:
     """用 ezdxf + pymupdf 后端把 DXF 的所有 layout 渲染为多页 PDF（保留每张图纸的真实尺寸）。
 
     渲染在独立子进程中进行（内存上限 4GB / 超时 90 分钟），失败可安全回退。
     百 MB 级的真实工程图 readfile 就要几分钟，图纸空间再多就按 layout 数倍增；
     子进程内部按 layout 并行渲染（fork 共享文档 + 每页独立时间预算），
     单页超时只丢那一页，不会整份回退 LibreOffice 压成 A4 废纸。
+
+    sheets_dir 不为 None 时，同时把每个 layout 单独保存为单页 PDF 到该目录。
     """
     if not EZDXF_AVAILABLE:
         return False, "未安装 ezdxf，无法渲染 DXF。"
 
+    cmd = [sys.executable, "-c", _EZDXF_RENDER_SCRIPT, str(dxf_path), str(pdf_path)]
+    if sheets_dir is not None:
+        cmd.append(str(sheets_dir))
+
     try:
         r = subprocess.run(
-            [sys.executable, "-c", _EZDXF_RENDER_SCRIPT, str(dxf_path), str(pdf_path)],
+            cmd,
             capture_output=True, text=True, timeout=5400,
         )
     except subprocess.TimeoutExpired:
@@ -833,6 +850,7 @@ def _convert_dwg_to_pdf(dwg_path: Path, project_id: int, doc: Document) -> tuple
     """
     out_dir = _dwg2pdf_dir(project_id, doc.id)
     pdf_path = out_dir / f"{dwg_path.stem}.pdf"
+    sheets_dir = out_dir / "sheets"
 
     if pdf_path.exists() and pdf_path.stat().st_size > 0:
         return pdf_path, None
@@ -858,7 +876,7 @@ def _convert_dwg_to_pdf(dwg_path: Path, project_id: int, doc: Document) -> tuple
                     last_err += f"ODA CLI：{err}"
 
             if dxf_path.exists() and dxf_path.stat().st_size > 0:
-                ok, msg = _dxf_to_pdf_via_ezdxf(dxf_path, pdf_path)
+                ok, msg = _dxf_to_pdf_via_ezdxf(dxf_path, pdf_path, sheets_dir=sheets_dir)
                 if ok:
                     return pdf_path, None
                 last_err += f"；ezdxf：{msg}"
@@ -872,7 +890,7 @@ def _convert_dwg_to_pdf(dwg_path: Path, project_id: int, doc: Document) -> tuple
     # 1. 优先用缓存的 DXF（macOS 用户用 ODA GUI 手动转的）
     cached_dxf = _find_cached_dxf(doc)
     if cached_dxf:
-        ok, msg = _dxf_to_pdf_via_ezdxf(cached_dxf, pdf_path)
+        ok, msg = _dxf_to_pdf_via_ezdxf(cached_dxf, pdf_path, sheets_dir=sheets_dir)
         if ok:
             return pdf_path, None
         ok2, msg2 = _dxf_to_pdf_via_libreoffice(cached_dxf, pdf_path)
@@ -1491,6 +1509,53 @@ def _render_panzoom_iframe(image_path: Path, key: str, height: int = 600) -> Non
     st.components.v1.html(html, height=height + 20, scrolling=False)
 
 
+def _get_sheet_pdfs(project_id: int, doc: Document) -> list[Path]:
+    """获取该 DWG 转换后所有单页 PDF（每张图纸一个 PDF），按文件名排序。"""
+    sheets_dir = _dwg2pdf_dir(project_id, doc.id) / "sheets"
+    if not sheets_dir.exists():
+        return []
+    return sorted(sheets_dir.glob("*.pdf"), key=lambda p: p.name)
+
+
+def _build_sheets_zip(project_id: int, doc: Document, sheet_pdfs: list[Path]) -> Path:
+    """把所有单页 PDF 打包成 zip，返回 zip 路径（命中缓存直接返回）。"""
+    out_dir = _dwg2pdf_dir(project_id, doc.id)
+    zip_path = out_dir / f"{Path(doc.filename).stem}_sheets.zip"
+    if zip_path.exists() and zip_path.stat().st_size > 0:
+        return zip_path
+    tmp = zip_path.with_suffix(".zip.tmp")
+    with zipfile.ZipFile(str(tmp), "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in sheet_pdfs:
+            zf.write(str(p), arcname=p.name)
+    tmp.replace(zip_path)
+    return zip_path
+
+
+def _generate_sheet_preview(sheet_pdf: Path, out_dir: Path,
+                             target_long_px: int = 5000) -> Path | None:
+    """为单个单页 PDF 生成 pan/zoom 预览 PNG，返回 PNG 路径。"""
+    if not PYMUPDF_AVAILABLE:
+        return None
+    preview_path = out_dir / f"{sheet_pdf.stem}_preview.png"
+    if preview_path.exists() and preview_path.stat().st_size > 0:
+        return preview_path
+    try:
+        pdf_doc = fitz.open(str(sheet_pdf))
+        try:
+            if pdf_doc.page_count == 0:
+                return None
+            page = pdf_doc.load_page(0)
+            long_pt = max(page.rect.width, page.rect.height, 1.0)
+            dpi = max(1, int(target_long_px * 72 / long_pt))
+            out = page.get_pixmap(dpi=dpi, alpha=False)
+            out.save(str(preview_path))
+        finally:
+            pdf_doc.close()
+    except Exception:
+        return None
+    return preview_path if preview_path.exists() else None
+
+
 def _render_pdf_preview(project_id: int, doc: Document):
     """展示 DXF 缓存状态、转换进度、PDF 预览与下载。"""
     dwg_path = _doc_file_path(project_id, doc)
@@ -1539,15 +1604,37 @@ def _render_pdf_preview(project_id: int, doc: Document):
         st.error(err or "转换失败。")
         return
 
+    # 获取所有单页 PDF
+    sheet_pdfs = _get_sheet_pdfs(project_id, doc)
+    sheet_count = len(sheet_pdfs)
+
+    # 显示转换结果统计
+    if sheet_count > 0:
+        st.success(f"✅ 转换完成，共生成 **{sheet_count} 张 PDF**")
+    else:
+        st.info("转换完成（合并 PDF 已生成）")
+
+    # 下载区域
     with col_dl2:
-        st.download_button(
-            label="⬇️ 下载转换后 PDF",
-            data=pdf_path.read_bytes(),
-            file_name=f"{Path(doc.filename).stem}.pdf",
-            mime="application/pdf",
-            key=f"download_pdf_{doc.id}",
-            use_container_width=True,
-        )
+        if sheet_count > 0:
+            zip_path = _build_sheets_zip(project_id, doc, sheet_pdfs)
+            st.download_button(
+                label=f"⬇️ 下载全部 PDF ({sheet_count}张，打包ZIP)",
+                data=zip_path.read_bytes(),
+                file_name=f"{Path(doc.filename).stem}_sheets.zip",
+                mime="application/zip",
+                key=f"download_pdf_zip_{doc.id}",
+                use_container_width=True,
+            )
+        else:
+            st.download_button(
+                label="⬇️ 下载转换后 PDF",
+                data=pdf_path.read_bytes(),
+                file_name=f"{Path(doc.filename).stem}.pdf",
+                mime="application/pdf",
+                key=f"download_pdf_{doc.id}",
+                use_container_width=True,
+            )
 
     if st.button("🔄 重新生成 PDF（清缓存重转，下游预览一起重算）",
                  key=f"regen_pdf_{doc.id}"):
@@ -1555,33 +1642,72 @@ def _render_pdf_preview(project_id: int, doc: Document):
         cached_pdf = out_dir / f"{dwg_path.stem}.pdf"
         if cached_pdf.exists():
             cached_pdf.unlink()
-        for sub in ("pages", "previews"):
+        for sub in ("pages", "previews", "sheets"):
             d = out_dir / sub
             if d.exists():
                 shutil.rmtree(d)
+        # 清掉旧 zip
+        for z in out_dir.glob("*_sheets.zip"):
+            z.unlink(missing_ok=True)
         st.rerun()
 
-    with st.spinner("正在生成可平移缩放的高清预览..."):
-        previews, prev_err = _generate_panzoom_previews(pdf_path, project_id, doc)
+    # ===== 单张 PDF 选择与预览 =====
+    if sheet_count > 0:
+        st.divider()
+        st.subheader("📄 图纸 PDF 预览")
+        st.caption(f"共 {sheet_count} 张图纸，下拉选择查看；鼠标滚轮缩放、拖拽平移")
 
-    if prev_err:
-        st.warning(prev_err)
-        return
-
-    st.divider()
-    st.subheader("🔍 全图预览（可平移缩放）")
-    st.caption("鼠标滚轮缩放、拖拽平移；右下角按钮可重置/放大/缩小。基于 5000px 长边渲染，矢量精度任意缩放不模糊")
-
-    if len(previews) == 1:
-        page_number = 1
-    else:
-        page_number = st.selectbox(
-            f"共 {len(previews)} 页，选择页码",
-            range(1, len(previews) + 1),
-            key=f"dwg2pdf_preview_page_{doc.id}",
+        # 下拉选择 PDF
+        sheet_options = [p.name for p in sheet_pdfs]
+        sheet_idx = st.selectbox(
+            "选择图纸",
+            range(len(sheet_options)),
+            format_func=lambda i: f"第 {i+1} 张 · {sheet_options[i]}",
+            key=f"dwg2pdf_sheet_selector_{doc.id}",
         )
-    preview_path = previews[page_number - 1]
-    _render_panzoom_iframe(preview_path, key=f"pz_{doc.id}_{page_number}")
+        selected_sheet = sheet_pdfs[sheet_idx]
+
+        # 单张下载按钮
+        st.download_button(
+            label=f"⬇️ 下载当前 PDF：{selected_sheet.name}",
+            data=selected_sheet.read_bytes(),
+            file_name=selected_sheet.name,
+            mime="application/pdf",
+            key=f"download_sheet_{doc.id}_{sheet_idx}",
+        )
+
+        # 生成预览图
+        sheets_dir = _dwg2pdf_dir(project_id, doc.id) / "sheets"
+        with st.spinner("正在生成预览..."):
+            preview_path = _generate_sheet_preview(selected_sheet, sheets_dir)
+
+        if preview_path:
+            _render_panzoom_iframe(preview_path, key=f"pz_sheet_{doc.id}_{sheet_idx}")
+        else:
+            st.warning("无法生成预览图。")
+    else:
+        # 没有单页 PDF 时，回退到合并 PDF 的多页预览（兼容旧数据 / LibreOffice 路径）
+        with st.spinner("正在生成可平移缩放的高清预览..."):
+            previews, prev_err = _generate_panzoom_previews(pdf_path, project_id, doc)
+
+        if prev_err:
+            st.warning(prev_err)
+            return
+
+        st.divider()
+        st.subheader("🔍 全图预览（可平移缩放）")
+        st.caption("鼠标滚轮缩放、拖拽平移；右下角按钮可重置/放大/缩小。基于 5000px 长边渲染，矢量精度任意缩放不模糊")
+
+        if len(previews) == 1:
+            page_number = 1
+        else:
+            page_number = st.selectbox(
+                f"共 {len(previews)} 页，选择页码",
+                range(1, len(previews) + 1),
+                key=f"dwg2pdf_preview_page_{doc.id}",
+            )
+        preview_path = previews[page_number - 1]
+        _render_panzoom_iframe(preview_path, key=f"pz_{doc.id}_{page_number}")
 
 
 
