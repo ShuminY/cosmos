@@ -1651,63 +1651,79 @@ def _render_pdf_preview(project_id: int, doc: Document):
             z.unlink(missing_ok=True)
         st.rerun()
 
-    # ===== 单张 PDF 选择与预览 =====
+    # ===== PDF 选择 + 页码选择 + 预览 =====
+    st.divider()
+    st.subheader("📄 图纸 PDF 预览")
+    st.caption("先选择 PDF，再选择页码；鼠标滚轮缩放、拖拽平移")
+
+    # 构建 PDF 列表：有 sheets 时用 sheet PDFs，否则用合并 PDF
     if sheet_count > 0:
-        st.divider()
-        st.subheader("📄 图纸 PDF 预览")
-        st.caption(f"共 {sheet_count} 张图纸，下拉选择查看；鼠标滚轮缩放、拖拽平移")
+        pdf_list = [(p.name, p) for p in sheet_pdfs]
+    else:
+        pdf_list = [(Path(pdf_path).name, pdf_path)]
 
-        # 下拉选择 PDF
-        sheet_options = [p.name for p in sheet_pdfs]
-        sheet_idx = st.selectbox(
-            "选择图纸",
-            range(len(sheet_options)),
-            format_func=lambda i: f"第 {i+1} 张 · {sheet_options[i]}",
-            key=f"dwg2pdf_sheet_selector_{doc.id}",
-        )
-        selected_sheet = sheet_pdfs[sheet_idx]
+    # --- 选择 PDF ---
+    pdf_idx = st.selectbox(
+        "选择 PDF",
+        range(len(pdf_list)),
+        format_func=lambda i: f"第 {i+1} 个 · {pdf_list[i][0]}",
+        key=f"dwg2pdf_pdf_selector_{doc.id}",
+    )
+    selected_pdf_name, selected_pdf_path = pdf_list[pdf_idx]
 
-        # 单张下载按钮
-        st.download_button(
-            label=f"⬇️ 下载当前 PDF：{selected_sheet.name}",
-            data=selected_sheet.read_bytes(),
-            file_name=selected_sheet.name,
-            mime="application/pdf",
-            key=f"download_sheet_{doc.id}_{sheet_idx}",
-        )
-
-        # 生成预览图
+    # 获取所选 PDF 的总页数和预览图
+    if sheet_count > 0:
+        # sheet PDF 模式：每个 PDF 是单页的，用 _generate_sheet_preview
         sheets_dir = _dwg2pdf_dir(project_id, doc.id) / "sheets"
         with st.spinner("正在生成预览..."):
-            preview_path = _generate_sheet_preview(selected_sheet, sheets_dir)
-
-        if preview_path:
-            _render_panzoom_iframe(preview_path, key=f"pz_sheet_{doc.id}_{sheet_idx}")
-        else:
-            st.warning("无法生成预览图。")
+            preview_path = _generate_sheet_preview(selected_pdf_path, sheets_dir)
+        total_pages = 1
+        preview_list = [preview_path] if preview_path else []
     else:
-        # 没有单页 PDF 时，回退到合并 PDF 的多页预览（兼容旧数据 / LibreOffice 路径）
+        # 合并 PDF 模式：用 _generate_panzoom_previews
         with st.spinner("正在生成可平移缩放的高清预览..."):
-            previews, prev_err = _generate_panzoom_previews(pdf_path, project_id, doc)
-
+            preview_list, prev_err = _generate_panzoom_previews(selected_pdf_path, project_id, doc)
         if prev_err:
             st.warning(prev_err)
             return
+        total_pages = len(preview_list)
 
-        st.divider()
-        st.subheader("🔍 全图预览（可平移缩放）")
-        st.caption("鼠标滚轮缩放、拖拽平移；右下角按钮可重置/放大/缩小。基于 5000px 长边渲染，矢量精度任意缩放不模糊")
+    # --- 选择页码 ---
+    if total_pages <= 1:
+        page_number = 1
+        st.selectbox(
+            "选择页码",
+            [1],
+            format_func=lambda x: f"第 {x} 页 / 共 {total_pages} 页",
+            key=f"dwg2pdf_page_selector_{doc.id}",
+            disabled=True,
+        )
+    else:
+        page_number = st.selectbox(
+            "选择页码",
+            range(1, total_pages + 1),
+            format_func=lambda x: f"第 {x} 页 / 共 {total_pages} 页",
+            key=f"dwg2pdf_page_selector_{doc.id}",
+        )
 
-        if len(previews) == 1:
-            page_number = 1
+    # --- 下载当前 PDF ---
+    st.download_button(
+        label=f"⬇️ 下载当前 PDF：{selected_pdf_name}",
+        data=selected_pdf_path.read_bytes(),
+        file_name=selected_pdf_name,
+        mime="application/pdf",
+        key=f"download_current_pdf_{doc.id}_{pdf_idx}",
+    )
+
+    # --- 预览图 ---
+    if preview_list and page_number <= len(preview_list):
+        preview_img = preview_list[page_number - 1]
+        if preview_img and preview_img.exists():
+            _render_panzoom_iframe(preview_img, key=f"pz_preview_{doc.id}_{pdf_idx}_{page_number}")
         else:
-            page_number = st.selectbox(
-                f"共 {len(previews)} 页，选择页码",
-                range(1, len(previews) + 1),
-                key=f"dwg2pdf_preview_page_{doc.id}",
-            )
-        preview_path = previews[page_number - 1]
-        _render_panzoom_iframe(preview_path, key=f"pz_{doc.id}_{page_number}")
+            st.warning("无法生成预览图。")
+    else:
+        st.warning("无法生成预览图。")
 
 
 

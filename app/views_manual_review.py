@@ -24,6 +24,7 @@ from src.time_utils import format_beijing, now_utc
 
 # 复用图纸分析已有的原子能力（不再重复实现）
 from views_drawings import (
+    _doc_file_path,
     _save_uploaded_drawing,
     _extract_labels_after_upload,
     _get_drawing_documents,
@@ -116,6 +117,79 @@ def _prepared_images_for(doc: Document, project_id: int) -> tuple[list[Path], st
     return image_paths, None
 
 
+def _get_pdf_list_for_doc(doc: Document, project_id: int) -> list[tuple[str, Path, int]]:
+    """获取该文档对应的 PDF 列表。
+
+    返回 [(pdf_display_name, pdf_path, page_count)]，按文件名排序。
+    优先使用 sheets/ 目录下的单页 PDF（如果存在），否则用合并的多页 PDF。
+    """
+    src_path = _doc_file_path(project_id, doc)
+    suffix = src_path.suffix.lower()
+
+    # 找到主 PDF 路径
+    main_pdf = None
+    sheets_dir = None
+
+    if suffix == ".pdf":
+        main_pdf = src_path
+        # 对于直接上传的 PDF，检查同目录下是否有 sheets/
+        sheets_dir = src_path.parent / "sheets"
+    elif suffix in (".dwg", ".dxf"):
+        conv_dir = Path("data") / "projects" / str(project_id) / "pdf_conversions" / str(doc.id)
+        candidates = sorted(conv_dir.glob(f"{src_path.stem}*.pdf"))
+        if candidates:
+            main_pdf = candidates[0]
+        sheets_dir = conv_dir / "sheets"
+
+    # 如果有 sheets 目录且里面有 PDF，优先用 sheets
+    if sheets_dir and sheets_dir.exists() and sheets_dir.is_dir():
+        sheet_pdfs = sorted(sheets_dir.glob("*.pdf"), key=lambda p: p.name)
+        sheet_pdfs = [p for p in sheet_pdfs if p.stat().st_size > 0]
+        if sheet_pdfs:
+            result = []
+            try:
+                import fitz as _fitz
+            except ImportError:
+                _fitz = None
+            for p in sheet_pdfs:
+                page_count = 1
+                if _fitz:
+                    try:
+                        d = _fitz.open(str(p))
+                        page_count = d.page_count
+                        d.close()
+                    except Exception:
+                        page_count = 1
+                result.append((p.name, p, page_count))
+            return result
+
+    # 否则用主 PDF
+    if main_pdf and main_pdf.exists():
+        page_count = 1
+        try:
+            import fitz as _fitz
+            d = _fitz.open(str(main_pdf))
+            page_count = d.page_count
+            d.close()
+        except Exception:
+            pass
+        return [(main_pdf.name, main_pdf, page_count)]
+
+    return []
+
+
+def _build_pdf_page_mapping(pdf_list: list[tuple[str, Path, int]]) -> list[tuple[int, int, int]]:
+    """构建全局页码 → (pdf_index, page_in_pdf) 的映射。
+
+    返回列表，索引为全局页码（0-based），值为 (pdf_index, page_in_pdf_0based)。
+    """
+    mapping = []
+    for pdf_idx, (_, _, page_count) in enumerate(pdf_list):
+        for i in range(page_count):
+            mapping.append((pdf_idx, i))
+    return mapping
+
+
 # ============ 页面：新增人工审核 ============
 def _select_or_upload_doc(project: Project) -> Document | None:
     """新增页只做上传：不再提供“选择已上传图纸”入口，避免与历史页职责重叠."""
@@ -192,18 +266,20 @@ def _select_or_upload_doc(project: Project) -> Document | None:
 
 
 def _render_page_navigation(doc_id: int, total_pages: int, labels: list[dict] | None = None,
-                            page_comment_counts: list[int] | None = None) -> int:
+                            page_comment_counts: list[int] | None = None,
+                            key_suffix: str = "") -> int:
     """页面导航（选择框 + 上一页/下一页）。返回 0-based selected_index.
 
-    labels 提供时，选择框会显示“第 N 页 图名图号”。
+    labels 提供时，选择框会显示"第 N 页 图名图号"。
     page_comment_counts 提供时，显示每页批注数量。
+    key_suffix 用于区分不同上下文的页码状态（如不同 PDF 各自保存页码）。
     """
     if total_pages <= 1:
         return 0
 
     labels = labels or []
     page_comment_counts = page_comment_counts or []
-    page_key = f"manual_review_page_{doc_id}"
+    page_key = f"manual_review_page_{doc_id}{key_suffix}"
     current = st.session_state.get(page_key, 0)
     # 如果 Streamlit 保存了选项对象，提取 value
     if isinstance(current, dict) and "value" in current:
@@ -226,12 +302,12 @@ def _render_page_navigation(doc_id: int, total_pages: int, labels: list[dict] | 
 
     col_prev, col_select, col_next = st.columns([1, 4, 1])
     with col_prev:
-        if st.button("⬅️ 上一页", key=f"manual_prev_{doc_id}",
+        if st.button("⬅️ 上一页", key=f"manual_prev_{doc_id}{key_suffix}",
                      disabled=current <= 0, width="stretch"):
             st.session_state[page_key] = current - 1
             st.rerun()
     with col_next:
-        if st.button("下一页 ➡️", key=f"manual_next_{doc_id}",
+        if st.button("下一页 ➡️", key=f"manual_next_{doc_id}{key_suffix}",
                      disabled=current >= total_pages - 1, width="stretch"):
             st.session_state[page_key] = current + 1
             st.rerun()
@@ -288,6 +364,10 @@ def _render_manual_review_workbench(doc: Document, project: Project):
         fresh_doc = s.query(Document).filter(Document.id == doc.id).first()
     fresh_data = _parse_analysis_data(fresh_doc) if fresh_doc else {}
 
+    # 获取 PDF 列表（多 PDF 时先选 PDF，再选页码）
+    pdf_list = _get_pdf_list_for_doc(doc, project.id)
+    pdf_page_mapping = _build_pdf_page_mapping(pdf_list) if pdf_list else []
+
     # 计算每页批注数量用于导航显示
     page_comment_counts = []
     all_manual_comments = fresh_data.get("manual_comments", {}) if fresh_data else {}
@@ -295,8 +375,64 @@ def _render_manual_review_workbench(doc: Document, project: Project):
         comments = _get_page_manual_comments(fresh_data, p)
         page_comment_counts.append(len(comments))
 
-    selected_index = _render_page_navigation(doc.id, total_pages, labels=labels if has_labels else None,
-                                            page_comment_counts=page_comment_counts)
+    # --- PDF 选择下拉（有多个 PDF 时显示在页码选择器上方） ---
+    if len(pdf_list) > 1:
+        pdf_selector_key = f"manual_review_pdf_selector_{doc.id}"
+        # 初始默认 PDF：优先用 session 中已保存的选择，否则根据全局页码反推
+        saved_pdf_idx = st.session_state.get(pdf_selector_key)
+        if isinstance(saved_pdf_idx, int) and 0 <= saved_pdf_idx < len(pdf_list):
+            default_pdf_idx = saved_pdf_idx
+        else:
+            # 从全局页码反推初始 PDF
+            current_global = st.session_state.get(f"manual_review_page_{doc.id}", 0)
+            if isinstance(current_global, dict) and "value" in current_global:
+                current_global = int(current_global["value"])
+            if not isinstance(current_global, int) or current_global < 0:
+                current_global = 0
+            default_pdf_idx = 0
+            if pdf_page_mapping and current_global < len(pdf_page_mapping):
+                default_pdf_idx = pdf_page_mapping[current_global][0]
+
+        selected_pdf_idx = st.selectbox(
+            "选择 PDF",
+            range(len(pdf_list)),
+            format_func=lambda i: f"第 {i+1} 个 · {pdf_list[i][0]}（{pdf_list[i][2]} 页）",
+            index=default_pdf_idx,
+            key=pdf_selector_key,
+        )
+
+        # 计算所选 PDF 的全局起始索引和页数
+        pdf_start_global = 0
+        for i in range(selected_pdf_idx):
+            pdf_start_global += pdf_list[i][2]
+        pdf_page_count = pdf_list[selected_pdf_idx][2]
+
+        # 构建当前 PDF 范围内的 labels 和批注计数
+        local_labels = None
+        local_comment_counts = []
+        if has_labels and labels:
+            end = min(pdf_start_global + pdf_page_count, len(labels))
+            local_labels = [labels[i] for i in range(pdf_start_global, end)]
+        end = min(pdf_start_global + pdf_page_count, total_pages)
+        for i in range(pdf_start_global, end):
+            local_comment_counts.append(page_comment_counts[i] if i < len(page_comment_counts) else 0)
+
+        # 页码导航（每个 PDF 有独立的页码状态，切换后回到上次位置）
+        selected_local = _render_page_navigation(
+            doc.id, pdf_page_count,
+            labels=local_labels,
+            page_comment_counts=local_comment_counts,
+            key_suffix=f"_pdf{selected_pdf_idx}",
+        )
+        selected_index = pdf_start_global + selected_local
+
+        # 同步全局页码（供其他依赖全局页码的逻辑使用）
+        st.session_state[f"manual_review_page_{doc.id}"] = selected_index
+    else:
+        # 只有一个 PDF，直接用原来的全局页码导航
+        selected_index = _render_page_navigation(doc.id, total_pages, labels=labels if has_labels else None,
+                                                page_comment_counts=page_comment_counts)
+
     page_number = selected_index + 1
     current_image = image_paths[selected_index]
     page_label = _format_page_label(labels, page_number) if has_labels else ""
