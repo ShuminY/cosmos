@@ -964,7 +964,9 @@ def _extract_labels_via_ocr(image_paths: list[Path]) -> list[dict]:
 
     try:
         from rapidocr_onnxruntime import RapidOCR
-    except ImportError:
+    except Exception:
+        # ImportError / numpy<2> 不兼容 (AttributeError: _ARRAY_API not found) / 其他
+        # onnxruntime 加载失败都会抛异常；直接跳过 OCR，走 PDF 文本层 + 视觉模型兜底
         return [{"title": "", "code": ""} for _ in image_paths]
 
     # 全局复用引擎，首次加载模型稍慢
@@ -1145,7 +1147,11 @@ def _ensure_page_labels(doc: Document, project_id: int, image_paths: list[Path],
                 labels[i]["code"] = codes[i]
 
     # 2) RapidOCR 抓图名 + 补图号（右侧标题栏区域，主路径）
-    ocr_labels = _extract_labels_via_ocr(image_paths)
+    # onnxruntime / numpy 版本不兼容可能导致崩溃，任何异常都跳过 OCR
+    try:
+        ocr_labels = _extract_labels_via_ocr(image_paths)
+    except Exception:
+        ocr_labels = []
     for i in range(min(total, len(ocr_labels))):
         if ocr_labels[i].get("title") and not labels[i].get("title"):
             labels[i]["title"] = ocr_labels[i]["title"]
