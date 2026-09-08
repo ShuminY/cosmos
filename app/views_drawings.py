@@ -955,167 +955,51 @@ def _save_page_labels(doc_id: int, labels: list[dict]):
 def _extract_labels_via_ocr(image_paths: list[Path]) -> list[dict]:
     """用 RapidOCR 从每页图纸右侧区域提取图名/图号。
 
-    标题栏一般在图纸右侧（右下角或右中），裁剪右侧条带做 OCR，减少无关内容干扰。
-    OCR 结果按行聚类，结合"图号/图名"等标签关键字定位对应单元格内容。
+    通过子进程调用 ocr_worker.py，避免 onnxruntime/numpy 版本不兼容
+    （AttributeError: _ARRAY_API not found）崩掉 Streamlit 主进程。
+    子进程崩溃、超时、输出异常都返回空结果，走 PDF 文本层 + 视觉模型兜底。
+
     返回长度==len(image_paths) 的 dict 列表，每项 {"title": str, "code": str}。
     """
     if not image_paths:
         return []
 
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-    except Exception:
-        # ImportError / numpy<2> 不兼容 (AttributeError: _ARRAY_API not found) / 其他
-        # onnxruntime 加载失败都会抛异常；直接跳过 OCR，走 PDF 文本层 + 视觉模型兜底
+    import sys as _sys
+    import json as _json
+
+    # ocr_worker.py 在 src/ 下，与本文件 app/ 同级
+    worker_script = Path(__file__).resolve().parent.parent / "src" / "ocr_worker.py"
+    if not worker_script.exists():
         return [{"title": "", "code": ""} for _ in image_paths]
 
-    # 全局复用引擎，首次加载模型稍慢
-    global _OCR_ENGINE
+    timeout = max(60, len(image_paths) * 15)  # 每页最多 15 秒，保底 60 秒
+
     try:
-        _OCR_ENGINE
-    except NameError:
-        try:
-            _OCR_ENGINE = RapidOCR()
-        except Exception:
+        proc = subprocess.run(
+            [_sys.executable, str(worker_script)] + [str(p) for p in image_paths],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
             return [{"title": "", "code": ""} for _ in image_paths]
-
-    # 常见的图名标签关键字（标题栏表格左列写的标签）
-    TITLE_LABELS = ("图名", "图纸名称", "名称", "设计图名", "图 名")
-    CODE_LABELS = ("图号", "图纸编号", "图 号", "编号", "图别")
-
-    code_re = re.compile(r"\b([A-Za-z]{1,3}[- ]?\d{1,3})\b")
-
-    results = []
-    # OCR 输入最长边上限：RapidOCR 内部会做缩放，太大了反而慢且占内存
-    OCR_MAX_LONG = 3000
-    for src in image_paths:
-        code = ""
-        title = ""
-        try:
-            from PIL import Image
-            import numpy as np
-            with Image.open(src) as img:
-                w, h = img.size
-                # 右侧条带：右 35% 宽，全高（标题栏常在右下角或右中，
-                # 但某些图的标题栏横跨右半侧上部，窄条会被裁掉）
-                box = (int(w * 0.65), 0, w, h)
-                crop = img.convert("RGB").crop(box)
-                # 放大 2 倍，小文字 OCR 效果好；但最长边不超过 OCR_MAX_LONG
-                cw, ch = crop.size
-                scale = 2.0
-                long_side = max(cw, ch) * scale
-                if long_side > OCR_MAX_LONG:
-                    scale = OCR_MAX_LONG / max(cw, ch)
-                new_w = max(1, int(cw * scale))
-                new_h = max(1, int(ch * scale))
-                if new_w != cw or new_h != ch:
-                    crop = crop.resize((new_w, new_h), Image.LANCZOS)
-                img_arr = np.array(crop)
-
-            ocr_result, _ = _OCR_ENGINE(img_arr)
-            if ocr_result is None:
-                ocr_result = []
-
-            # 解析 box 中心点 + 文本
-            items = []  # [(cx, cy, text, score)]
-            for item in ocr_result:
-                if len(item) < 3:
-                    continue
-                box_pts = item[0]
-                text = str(item[1]).strip()
-                conf = float(item[2]) if len(item) > 2 else 0.5
-                if not text or conf < 0.3:
-                    continue
-                # box_pts: [[x,y],[x,y],[x,y],[x,y]] → 中心
-                xs = [p[0] for p in box_pts]
-                ys = [p[1] for p in box_pts]
-                cx, cy = sum(xs) / 4, sum(ys) / 4
-                items.append((cx, cy, text, conf))
-
-            if not items:
-                results.append({"title": "", "code": ""})
-                continue
-
-            # 按 y 聚类成行（同一段高度差 < 20px 算同一行）
-            items_sorted = sorted(items, key=lambda x: x[1])
-            rows: list[list[tuple]] = []
-            row_y = -1e9
-            for it in items_sorted:
-                cy = it[1]
-                if cy - row_y > 25:
-                    rows.append([it])
-                    row_y = cy
-                else:
-                    rows[-1].append(it)
-
-            # 每行按 x 排序
-            for row in rows:
-                row.sort(key=lambda x: x[0])
-
-            # 策略 1：找"图名"标签行 → 同行靠右的文字是图名
-            # 策略 2：找含图号模式且靠右的 → 图号
-            # 策略 3：纯文本最长的中文行 → 兜底图名
-
-            best_code_score = -1.0
-            best_title_score = -1.0
-
-            for row in rows:
-                row_text_joined = "".join(t for _, _, t, _ in row)
-
-                # ---- 图号 ----
-                for cx, cy, text, conf in row:
-                    for m in code_re.finditer(text):
-                        candidate = m.group(1).replace(" ", "").upper()
-                        if len(candidate) < 2 or len(candidate) > 10:
-                            continue
-                        # 得分：置信度 + 越靠右越高（标题栏图号常在最右列）
-                        score = conf + cx / max(crop.width, 1) * 0.5
-                        if score > best_code_score:
-                            best_code_score = score
-                            code = candidate
-
-                # ---- 图名：先找标签 ----
-                for idx, (cx, cy, text, conf) in enumerate(row):
-                    is_label = any(lab in text for lab in TITLE_LABELS)
-                    if is_label:
-                        # 同行后面的单元格就是图名内容
-                        candidates_after = [
-                            t for j, (_, _, t, _) in enumerate(row) if j > idx
-                        ]
-                        if candidates_after:
-                            name = "".join(candidates_after).strip()
-                            name = name.lstrip(":：").strip()
-                            cjk_count = sum(1 for c in name if '一' <= c <= '鿿')
-                            if cjk_count >= 2 and len(name) <= 40:
-                                title = name
-                                best_title_score = 99.0  # 标签匹配优先级最高
-                                break
-
-                if best_title_score >= 99.0:
-                    break
-
-            # 兜底：没找到标签就取 CJK 字符最多的一行
-            if not title:
-                best_row_cjk = 0
-                for row in rows:
-                    row_text = "".join(t for _, _, t, _ in row)
-                    cjk_count = sum(1 for c in row_text if '一' <= c <= '鿿')
-                    # 排除含图号标签或纯图号的行
-                    has_code_label = any(lab in row_text for lab in CODE_LABELS)
-                    if cjk_count > best_row_cjk and not has_code_label \
-                            and 4 <= len(row_text) <= 40 and cjk_count >= 3:
-                        best_row_cjk = cjk_count
-                        # 清理掉尾部的图号/字母编号
-                        clean = code_re.sub('', row_text).strip()
-                        clean = clean.rstrip(":：-—").strip()
-                        if 3 <= len(clean) <= 40:
-                            title = clean
-        except Exception:
-            pass
-
-        results.append({"title": title, "code": code})
-
-    return results
+        results = _json.loads(proc.stdout)
+        if not isinstance(results, list) or len(results) != len(image_paths):
+            return [{"title": "", "code": ""} for _ in image_paths]
+        # 规整化每项
+        normalized = []
+        for r in results:
+            if isinstance(r, dict):
+                normalized.append({
+                    "title": str(r.get("title", "")),
+                    "code": str(r.get("code", "")),
+                })
+            else:
+                normalized.append({"title": "", "code": ""})
+        return normalized
+    except Exception:
+        # 超时、子进程崩溃、JSON 解析失败等全部跳过
+        return [{"title": "", "code": ""} for _ in image_paths]
 
 
 def _ensure_page_labels(doc: Document, project_id: int, image_paths: list[Path],
