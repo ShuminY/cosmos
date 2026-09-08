@@ -808,8 +808,8 @@ def _extract_pdf_sheet_codes(pdf_path: Path) -> list[str]:
                     continue
                 x0, y0, x1, y1 = block["bbox"]
                 cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-                # 图号一般在页面右下角；用矩形距离右下角的比例作为得分（越靠右下越高）
-                if cy < h * 0.55 or cx < w * 0.55:
+                # 图号一般在页面右侧（右中或右下）；只搜索右半侧
+                if cx < w * 0.55:
                     continue
                 text = "".join(
                     span["text"]
@@ -820,8 +820,9 @@ def _extract_pdf_sheet_codes(pdf_path: Path) -> list[str]:
                     continue
                 for match in _SHEET_CODE_PATTERN.finditer(text):
                     candidate = match.group(1).replace(" ", "").replace("-", "-").upper()
-                    # 得分：靠右下 + 单元格短（长文本里含相似模式的概率高）
-                    score = (cx / w) + (cy / h) - min(1.0, len(text) / 40)
+                    # 得分：越靠右越高 + 单元格短（长文本里含相似模式的概率高）
+                    # 图号不一定在最下面，所以 y 只做小幅加权（偏下略优）
+                    score = (cx / w) * 1.5 + (cy / h) * 0.3 - min(1.0, len(text) / 40)
                     if score > best_score:
                         best_score = score
                         code = candidate
@@ -851,8 +852,9 @@ def _extract_page_titles_via_vision(image_paths: list[Path], provider: str | Non
         try:
             with Image.open(src) as img:
                 w, h = img.size
-                # 右下 40% × 45%
-                box = (int(w * 0.60), int(h * 0.55), w, h)
+                # 右侧条带：右 35% 宽，全高（标题栏一般在右侧，
+                # 可能在右下角也可能在右中部，窄条覆盖更全）
+                box = (int(w * 0.65), 0, w, h)
                 crop = img.convert("RGB").crop(box)
                 crop_path = src.parent / f"__titleblock_{src.stem}.png"
                 crop.save(crop_path, format="PNG")
@@ -940,12 +942,166 @@ def _save_page_labels(doc_id: int, labels: list[dict]):
         s.commit()
 
 
+def _extract_labels_via_ocr(image_paths: list[Path]) -> list[dict]:
+    """用 RapidOCR 从每页图纸右侧区域提取图名/图号。
+
+    标题栏一般在图纸右侧（右下角或右中），裁剪右侧条带做 OCR，减少无关内容干扰。
+    OCR 结果按行聚类，结合"图号/图名"等标签关键字定位对应单元格内容。
+    返回长度==len(image_paths) 的 dict 列表，每项 {"title": str, "code": str}。
+    """
+    if not image_paths:
+        return []
+
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        return [{"title": "", "code": ""} for _ in image_paths]
+
+    # 全局复用引擎，首次加载模型稍慢
+    global _OCR_ENGINE
+    try:
+        _OCR_ENGINE
+    except NameError:
+        try:
+            _OCR_ENGINE = RapidOCR()
+        except Exception:
+            return [{"title": "", "code": ""} for _ in image_paths]
+
+    # 常见的图名标签关键字（标题栏表格左列写的标签）
+    TITLE_LABELS = ("图名", "图纸名称", "名称", "设计图名", "图 名")
+    CODE_LABELS = ("图号", "图纸编号", "图 号", "编号", "图别")
+
+    code_re = re.compile(r"\b([A-Za-z]{1,3}[- ]?\d{1,3})\b")
+
+    results = []
+    for src in image_paths:
+        code = ""
+        title = ""
+        try:
+            from PIL import Image
+            import numpy as np
+            with Image.open(src) as img:
+                w, h = img.size
+                # 右侧条带：右 35% 宽，全高（标题栏常在右下角或右中，
+                # 但某些图的标题栏横跨右半侧上部，窄条会被裁掉）
+                box = (int(w * 0.65), 0, w, h)
+                crop = img.convert("RGB").crop(box)
+                # 放大 2 倍，小文字 OCR 效果好
+                crop = crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)
+                img_arr = np.array(crop)
+
+            ocr_result, _ = _OCR_ENGINE(img_arr)
+            if ocr_result is None:
+                ocr_result = []
+
+            # 解析 box 中心点 + 文本
+            items = []  # [(cx, cy, text, score)]
+            for item in ocr_result:
+                if len(item) < 3:
+                    continue
+                box_pts = item[0]
+                text = str(item[1]).strip()
+                conf = float(item[2]) if len(item) > 2 else 0.5
+                if not text or conf < 0.3:
+                    continue
+                # box_pts: [[x,y],[x,y],[x,y],[x,y]] → 中心
+                xs = [p[0] for p in box_pts]
+                ys = [p[1] for p in box_pts]
+                cx, cy = sum(xs) / 4, sum(ys) / 4
+                items.append((cx, cy, text, conf))
+
+            if not items:
+                results.append({"title": "", "code": ""})
+                continue
+
+            # 按 y 聚类成行（同一段高度差 < 20px 算同一行）
+            items_sorted = sorted(items, key=lambda x: x[1])
+            rows: list[list[tuple]] = []
+            row_y = -1e9
+            for it in items_sorted:
+                cy = it[1]
+                if cy - row_y > 25:
+                    rows.append([it])
+                    row_y = cy
+                else:
+                    rows[-1].append(it)
+
+            # 每行按 x 排序
+            for row in rows:
+                row.sort(key=lambda x: x[0])
+
+            # 策略 1：找"图名"标签行 → 同行靠右的文字是图名
+            # 策略 2：找含图号模式且靠右的 → 图号
+            # 策略 3：纯文本最长的中文行 → 兜底图名
+
+            best_code_score = -1.0
+            best_title_score = -1.0
+
+            for row in rows:
+                row_text_joined = "".join(t for _, _, t, _ in row)
+
+                # ---- 图号 ----
+                for cx, cy, text, conf in row:
+                    for m in code_re.finditer(text):
+                        candidate = m.group(1).replace(" ", "").upper()
+                        if len(candidate) < 2 or len(candidate) > 10:
+                            continue
+                        # 得分：置信度 + 越靠右越高（标题栏图号常在最右列）
+                        score = conf + cx / max(crop.width, 1) * 0.5
+                        if score > best_code_score:
+                            best_code_score = score
+                            code = candidate
+
+                # ---- 图名：先找标签 ----
+                for idx, (cx, cy, text, conf) in enumerate(row):
+                    is_label = any(lab in text for lab in TITLE_LABELS)
+                    if is_label:
+                        # 同行后面的单元格就是图名内容
+                        candidates_after = [
+                            t for j, (_, _, t, _) in enumerate(row) if j > idx
+                        ]
+                        if candidates_after:
+                            name = "".join(candidates_after).strip()
+                            name = name.lstrip(":：").strip()
+                            cjk_count = sum(1 for c in name if '一' <= c <= '鿿')
+                            if cjk_count >= 2 and len(name) <= 40:
+                                title = name
+                                best_title_score = 99.0  # 标签匹配优先级最高
+                                break
+
+                if best_title_score >= 99.0:
+                    break
+
+            # 兜底：没找到标签就取 CJK 字符最多的一行
+            if not title:
+                best_row_cjk = 0
+                for row in rows:
+                    row_text = "".join(t for _, _, t, _ in row)
+                    cjk_count = sum(1 for c in row_text if '一' <= c <= '鿿')
+                    # 排除含图号标签或纯图号的行
+                    has_code_label = any(lab in row_text for lab in CODE_LABELS)
+                    if cjk_count > best_row_cjk and not has_code_label \
+                            and 4 <= len(row_text) <= 40 and cjk_count >= 3:
+                        best_row_cjk = cjk_count
+                        # 清理掉尾部的图号/字母编号
+                        clean = code_re.sub('', row_text).strip()
+                        clean = clean.rstrip(":：-—").strip()
+                        if 3 <= len(clean) <= 40:
+                            title = clean
+        except Exception:
+            pass
+
+        results.append({"title": title, "code": code})
+
+    return results
+
+
 def _ensure_page_labels(doc: Document, project_id: int, image_paths: list[Path],
                        use_vision: bool = True, provider: str | None = None,
                        force: bool = False) -> list[dict]:
-    """确保 Document 有 page_labels；没有则先用 PDF 文本层提图号，再用视觉模型补图名。
+    """确保 Document 有 page_labels；提取优先级：PDF 文本层 → RapidOCR → 视觉 LLM。
 
-    - use_vision=False 时跳过 LLM 调用，只做文本层图号提取
+    - use_vision=False 时跳过视觉 LLM 调用，但仍会用 OCR 抓图名
     - force=True 时忽略缓存重跑
     - 返回最终的 labels 列表；空图纸/失败返回 []
     """
@@ -960,7 +1116,7 @@ def _ensure_page_labels(doc: Document, project_id: int, image_paths: list[Path],
     total = len(image_paths)
     labels = [{"title": "", "code": ""} for _ in range(total)]
 
-    # 1) 从 PDF 文本层抓图号
+    # 1) 从 PDF 文本层抓图号（最快最准）
     file_path = _doc_file_path(project_id, doc)
     if file_path.suffix.lower() == ".pdf" and PYMUPDF_AVAILABLE:
         codes = _extract_pdf_sheet_codes(file_path)
@@ -968,18 +1124,31 @@ def _ensure_page_labels(doc: Document, project_id: int, image_paths: list[Path],
             if codes[i]:
                 labels[i]["code"] = codes[i]
 
-    # 2) 视觉模型抓图名
+    # 2) RapidOCR 抓图名 + 补图号（右侧标题栏区域，主路径）
+    ocr_labels = _extract_labels_via_ocr(image_paths)
+    for i in range(min(total, len(ocr_labels))):
+        if ocr_labels[i].get("title") and not labels[i].get("title"):
+            labels[i]["title"] = ocr_labels[i]["title"]
+        if ocr_labels[i].get("code") and not labels[i].get("code"):
+            labels[i]["code"] = ocr_labels[i]["code"]
+
+    # 3) 视觉模型（兜底，OCR 没识别出来时才用）
     if use_vision:
-        try:
-            vision_labels = _extract_page_titles_via_vision(image_paths, provider=provider)
-        except Exception:
-            vision_labels = []
-        for i in range(min(total, len(vision_labels))):
-            if vision_labels[i].get("title"):
-                labels[i]["title"] = vision_labels[i]["title"]
-            # 视觉模型抓到的图号只在文本层没读到时才用（PDF 文本层更权威）
-            if not labels[i]["code"] and vision_labels[i].get("code"):
-                labels[i]["code"] = vision_labels[i]["code"]
+        need_vision = [i for i in range(total)
+                       if not labels[i].get("title") or not labels[i].get("code")]
+        if need_vision:
+            try:
+                vision_labels = _extract_page_titles_via_vision(
+                    image_paths, provider=provider
+                )
+            except Exception:
+                vision_labels = []
+            for i in need_vision:
+                if i < len(vision_labels):
+                    if not labels[i].get("title") and vision_labels[i].get("title"):
+                        labels[i]["title"] = vision_labels[i]["title"]
+                    if not labels[i].get("code") and vision_labels[i].get("code"):
+                        labels[i]["code"] = vision_labels[i]["code"]
 
     _save_page_labels(doc.id, labels)
     return labels
