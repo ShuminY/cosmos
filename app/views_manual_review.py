@@ -355,8 +355,29 @@ def _render_manual_review_workbench(doc: Document, project: Project):
         if st.button("🔤 提取页面名称", key=f"extract_labels_{doc.id}", width="stretch",
                      help="先从 PDF 文本层提取图号，再用视觉模型识别图名"):
             with st.spinner("正在提取页面名称（图号+图名）..."):
-                labels = _ensure_page_labels(doc, project.id, image_paths, use_vision=True, force=True)
-            st.success("页面名称已提取完成。")
+                labels, details = _ensure_page_labels(
+                    doc, project.id, image_paths, use_vision=True, force=True,
+                    return_details=True,
+                )
+            named = details.get("named", 0)
+            total = details.get("total", len(image_paths))
+            msg_parts = [f"提取完成：{named}/{total} 页有结果。"]
+            sub_parts = []
+            if details.get("pdf_codes"):
+                sub_parts.append(f"PDF文本层图号 {details['pdf_codes']} 个")
+            if details.get("ocr_titles") or details.get("ocr_codes"):
+                sub_parts.append(f"OCR图名{details.get('ocr_titles', 0)} / 图号{details.get('ocr_codes', 0)}")
+            if details.get("vision_titles") or details.get("vision_codes"):
+                sub_parts.append(
+                    f"视觉模型图名{details.get('vision_titles', 0)} / 图号{details.get('vision_codes', 0)}"
+                )
+            if sub_parts:
+                msg_parts.append("（" + "；".join(sub_parts) + "）")
+            st.success("".join(msg_parts))
+            if details.get("ocr_error"):
+                st.caption(f"⚠️ OCR：{details['ocr_error']}")
+            if details.get("vision_error"):
+                st.warning(f"⚠️ 视觉模型：{details['vision_error']}")
             st.rerun()
 
     # 重新从 DB 读取最新的 analysis_data（含新增批注）

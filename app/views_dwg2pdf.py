@@ -1196,12 +1196,12 @@ def _convert_pdf_to_images(pdf_path: Path, project_id: int, doc: Document) -> tu
         for page_index in range(pdf_doc.page_count):
             page = pdf_doc.load_page(page_index)
             # 自适应 dpi：ezdxf 渲染的工程图页面可能有几米宽（PDF 上限 ~5000mm），
-            # 固定 150dpi 会产出几万像素的 PNG。按最长边 ~12000px 折算 dpi
-            # （2400px 时 3mm 高的标注文字只有几个像素，放大后完全看不清），
-            # 普通 A 系列页面不受影响（折算值 > 150 仍按 150 出图）。
+            # 固定 300dpi 会产出几万像素的 PNG。按最长边 ~12000px 折算 dpi
+            # （150dpi 时小标注文字发虚，300dpi 文字清晰且文件体积可控），
+            # 普通 A 系列页面不受影响（折算值 > 300 仍按 300 出图）。
             max_side_pt = max(page.rect.width, page.rect.height, 1.0)
-            dpi = int(min(150, 12000 * 72 / max_side_pt))
-            dpi = max(36, dpi)
+            dpi = int(min(300, 12000 * 72 / max_side_pt))
+            dpi = max(72, dpi)
             pix = page.get_pixmap(dpi=dpi, alpha=False)
             pix.save(str(output_dir / f"page_{page_index + 1:03d}.png"))
     except Exception as e:
@@ -1306,7 +1306,7 @@ def _split_pdf_to_content_images(pdf_path: Path, project_id: int, doc: Document,
         return [], "缺少 numpy，无法做内容切分。"
 
     ANALYSIS_DPI = 72
-    OUT_DPI = 150
+    OUT_DPI = 300
     MARGIN_MM = 8
     MIN_BOX_PX = 300  # 原图坐标的最小边长 < 300px 视为碎片丢弃
 

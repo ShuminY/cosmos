@@ -209,7 +209,10 @@ def _convert_pdf_to_images(pdf_path: Path, project_id: int, doc_id: int) -> list
         try:
             for page_index in range(pdf_doc.page_count):
                 page = pdf_doc.load_page(page_index)
-                pix = page.get_pixmap(dpi=200, alpha=False)
+                max_side_pt = max(page.rect.width, page.rect.height, 1.0)
+                dpi = int(min(300, 12000 * 72 / max_side_pt))
+                dpi = max(72, dpi)
+                pix = page.get_pixmap(dpi=dpi, alpha=False)
                 pix.save(str(output_dir / f"page_{page_index + 1:03d}.png"))
         finally:
             pdf_doc.close()
@@ -217,9 +220,10 @@ def _convert_pdf_to_images(pdf_path: Path, project_id: int, doc_id: int) -> list
 
     if PDF2IMAGE_AVAILABLE:
         try:
+            # pdf2image 路径用固定 300 dpi（备用路径，自适应逻辑统一在 PyMuPDF 路径）
             convert_from_path(
                 str(pdf_path),
-                dpi=200,
+                dpi=300,
                 fmt="png",
                 thread_count=4,
                 use_pdftocairo=True,
@@ -419,7 +423,7 @@ def _convert_dwg_via_jenkins(file_path: Path, out_dir: Path) -> tuple[list[Path]
     if pdf_path is None or not pdf_path.exists():
         return [], f"Jenkins 转换失败：{err or '未生成 PDF'}"
 
-    # PyMuPDF 拆 PNG（与 ODA+LO 路径一致，150dpi，page_NNN.png）
+    # PyMuPDF 拆 PNG（自适应 DPI：目标 300dpi，长边 12000px 封顶，避免超大页爆内存）
     try:
         import fitz as _fitz
         pdf = _fitz.open(str(pdf_path))
@@ -427,7 +431,10 @@ def _convert_dwg_via_jenkins(file_path: Path, out_dir: Path) -> tuple[list[Path]
         try:
             for i in range(pdf.page_count):
                 page = pdf.load_page(i)
-                pix = page.get_pixmap(dpi=150)
+                max_side_pt = max(page.rect.width, page.rect.height, 1.0)
+                dpi = int(min(300, 12000 * 72 / max_side_pt))
+                dpi = max(72, dpi)
+                pix = page.get_pixmap(dpi=dpi, alpha=False)
                 out_path = out_dir / f"page_{i + 1:03d}.png"
                 pix.save(str(out_path))
                 image_paths.append(out_path)
@@ -538,7 +545,10 @@ def _convert_cad_via_libreoffice(file_path: Path, out_dir: Path) -> tuple[list[P
         try:
             for i in range(pdf.page_count):
                 page = pdf.load_page(i)
-                pix = page.get_pixmap(dpi=150)
+                max_side_pt = max(page.rect.width, page.rect.height, 1.0)
+                dpi = int(min(300, 12000 * 72 / max_side_pt))
+                dpi = max(72, dpi)
+                pix = page.get_pixmap(dpi=dpi, alpha=False)
                 out_path = out_dir / f"page_{i + 1:03d}.png"
                 pix.save(str(out_path))
                 image_paths.append(out_path)
@@ -751,7 +761,10 @@ def _convert_dwg_via_oda_and_lo(file_path: Path, out_dir: Path,
         try:
             for i in range(pdf.page_count):
                 page = pdf.load_page(i)
-                pix = page.get_pixmap(dpi=150)
+                max_side_pt = max(page.rect.width, page.rect.height, 1.0)
+                dpi = int(min(300, 12000 * 72 / max_side_pt))
+                dpi = max(72, dpi)
+                pix = page.get_pixmap(dpi=dpi, alpha=False)
                 out_path = out_dir / f"page_{i + 1:03d}.png"
                 pix.save(str(out_path))
                 image_paths.append(out_path)
@@ -1004,23 +1017,43 @@ def _extract_labels_via_ocr(image_paths: list[Path]) -> list[dict]:
 
 def _ensure_page_labels(doc: Document, project_id: int, image_paths: list[Path],
                        use_vision: bool = True, provider: str | None = None,
-                       force: bool = False) -> list[dict]:
+                       force: bool = False,
+                       return_details: bool = False):
     """确保 Document 有 page_labels；提取优先级：PDF 文本层 → RapidOCR → 视觉 LLM。
 
     - use_vision=False 时跳过视觉 LLM 调用，但仍会用 OCR 抓图名
     - force=True 时忽略缓存重跑
-    - 返回最终的 labels 列表；空图纸/失败返回 []
+    - return_details=True 时返回 (labels, details_dict)，details 含各阶段提取数量与错误
+    - 否则只返回 labels 列表；空图纸/失败返回 []
     """
     if not image_paths:
+        if return_details:
+            return [], {"total": 0, "pdf_codes": 0, "ocr_titles": 0,
+                         "vision_titles": 0, "vision_error": None, "ocr_error": None,
+                         "named": 0}
         return []
 
     data = _parse_analysis_data(doc)
     cached = _load_page_labels(data)
     if not force and cached and len(cached) == len(image_paths):
+        if return_details:
+            named = sum(1 for x in cached if x.get("title") or x.get("code"))
+            return cached, {"total": len(cached), "from_cache": True, "named": named}
         return cached
 
     total = len(image_paths)
     labels = [{"title": "", "code": ""} for _ in range(total)]
+    details = {
+        "total": total,
+        "pdf_codes": 0,
+        "ocr_titles": 0,
+        "ocr_codes": 0,
+        "ocr_error": None,
+        "vision_titles": 0,
+        "vision_codes": 0,
+        "vision_error": None,
+        "named": 0,
+    }
 
     # 1) 从 PDF 文本层抓图号（最快最准）
     file_path = _doc_file_path(project_id, doc)
@@ -1029,38 +1062,63 @@ def _ensure_page_labels(doc: Document, project_id: int, image_paths: list[Path],
         for i in range(min(total, len(codes))):
             if codes[i]:
                 labels[i]["code"] = codes[i]
+        details["pdf_codes"] = sum(1 for x in labels if x["code"])
 
     # 2) RapidOCR 抓图名 + 补图号（右侧标题栏区域，主路径）
     # onnxruntime / numpy 版本不兼容可能导致崩溃，任何异常都跳过 OCR
+    ocr_titles_before = sum(1 for x in labels if x["title"])
+    ocr_codes_before = sum(1 for x in labels if x["code"])
+    ocr_err = None
     try:
         ocr_labels = _extract_labels_via_ocr(image_paths)
-    except Exception:
+        if not ocr_labels:
+            ocr_err = "OCR 未返回结果（可能 onnxruntime/numpy 不兼容或子进程失败）"
+    except Exception as e:
         ocr_labels = []
+        ocr_err = str(e)
     for i in range(min(total, len(ocr_labels))):
         if ocr_labels[i].get("title") and not labels[i].get("title"):
             labels[i]["title"] = ocr_labels[i]["title"]
         if ocr_labels[i].get("code") and not labels[i].get("code"):
             labels[i]["code"] = ocr_labels[i]["code"]
+    details["ocr_titles"] = sum(1 for x in labels if x["title"]) - ocr_titles_before
+    details["ocr_codes"] = sum(1 for x in labels if x["code"]) - ocr_codes_before
+    details["ocr_error"] = ocr_err
 
     # 3) 视觉模型（兜底，OCR 没识别出来时才用）
+    vision_err = None
     if use_vision:
         need_vision = [i for i in range(total)
                        if not labels[i].get("title") or not labels[i].get("code")]
         if need_vision:
+            vis_titles_before = sum(1 for x in labels if x["title"])
+            vis_codes_before = sum(1 for x in labels if x["code"])
             try:
                 vision_labels = _extract_page_titles_via_vision(
                     image_paths, provider=provider
                 )
-            except Exception:
+                if not vision_labels or all(
+                    not (v.get("title") or v.get("code")) for v in vision_labels
+                ):
+                    vision_err = "视觉模型未返回有效结果（请检查 API 配置或模型是否支持图像输入）"
+            except Exception as e:
                 vision_labels = []
+                vision_err = str(e)
             for i in need_vision:
                 if i < len(vision_labels):
                     if not labels[i].get("title") and vision_labels[i].get("title"):
                         labels[i]["title"] = vision_labels[i]["title"]
                     if not labels[i].get("code") and vision_labels[i].get("code"):
                         labels[i]["code"] = vision_labels[i]["code"]
+            details["vision_titles"] = sum(1 for x in labels if x["title"]) - vis_titles_before
+            details["vision_codes"] = sum(1 for x in labels if x["code"]) - vis_codes_before
+            details["vision_error"] = vision_err
+
+    details["named"] = sum(1 for x in labels if x.get("title") or x.get("code"))
 
     _save_page_labels(doc.id, labels)
+    if return_details:
+        return labels, details
     return labels
 
 
@@ -3351,6 +3409,18 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
   <div id="frame-{safe_key}" style="border:1px solid #e5e7eb; border-radius:8px; background:#f9fafb; overflow:auto; max-height:864px; cursor:grab; position:relative;">
     <img id="img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px;" />
   </div>
+  <!-- 全屏查看原图覆盖层，避免 data: URL 太长导致 window.open 失败 -->
+  <div id="modal-{safe_key}" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:99999; overflow:auto; cursor:grab;">
+    <div style="position:sticky; top:8px; left:8px; z-index:10; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <button id="modal-close-{safe_key}" style="padding:0.4rem 0.8rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">✕ 关闭</button>
+      <button id="modal-zoomout-{safe_key}" style="padding:0.4rem 0.8rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">➖</button>
+      <button id="modal-zoomin-{safe_key}" style="padding:0.4rem 0.8rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">➕</button>
+      <button id="modal-reset-{safe_key}" style="padding:0.4rem 0.8rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">复位</button>
+      <span id="modal-pct-{safe_key}" style="color:#fff; font-size:0.9rem; text-shadow:0 0 4px #000;">100%</span>
+      <span style="color:#d1d5db; font-size:0.85rem; margin-left:auto; margin-right:12px;">原始 {width} × {height}px · 滚轮缩放 · 拖动查看</span>
+    </div>
+    <img id="modal-img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px; margin:8px;" />
+  </div>
 </div>
 <script>
 (function() {{
@@ -3445,7 +3515,74 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
   }});
 
   document.getElementById('open-{safe_key}').addEventListener('click', function() {{
-    window.open(img.src, '_blank', 'noopener,noreferrer');
+    const modal = document.getElementById('modal-{safe_key}');
+    modal.style.display = 'block';
+    // 打开时先自适应宽度
+    const mImg = document.getElementById('modal-img-{safe_key}');
+    const avail = window.innerWidth - 16;
+    let s = Math.min(1, avail / baseW);
+    mscale = s;
+    mImg.style.width = (baseW * s) + 'px';
+    mImg.style.height = (baseH * s) + 'px';
+    document.getElementById('modal-pct-{safe_key}').textContent = Math.round(s * 100) + '%';
+    window.scrollTo(0, 0);
+  }});
+
+  // 全屏覆盖层交互
+  const mImg = document.getElementById('modal-img-{safe_key}');
+  const mPct = document.getElementById('modal-pct-{safe_key}');
+  let mscale = 1;
+  function mapply() {{
+    mImg.style.width = (baseW * mscale) + 'px';
+    mImg.style.height = (baseH * mscale) + 'px';
+    mPct.textContent = Math.round(mscale * 100) + '%';
+  }}
+  function mzoom(factor, centerX, centerY) {{
+    const oldScale = mscale;
+    const newScale = Math.min(8, Math.max(0.05, mscale * factor));
+    if (newScale === oldScale) return;
+    const cxImg = window.scrollX + centerX;
+    const cyImg = window.scrollY + centerY;
+    mscale = newScale;
+    mapply();
+    const ratio = newScale / oldScale;
+    window.scrollTo(Math.max(0, cxImg * ratio - centerX), Math.max(0, cyImg * ratio - centerY));
+  }}
+  function mfit() {{
+    const avail = window.innerWidth - 16;
+    mscale = Math.min(1, avail / baseW);
+    mapply();
+  }}
+  document.getElementById('modal-close-{safe_key}').addEventListener('click', function() {{
+    document.getElementById('modal-{safe_key}').style.display = 'none';
+  }});
+  document.getElementById('modal-zoomin-{safe_key}').addEventListener('click', () => mzoom(1.25, window.innerWidth/2, window.innerHeight/2));
+  document.getElementById('modal-zoomout-{safe_key}').addEventListener('click', () => mzoom(0.8, window.innerWidth/2, window.innerHeight/2));
+  document.getElementById('modal-reset-{safe_key}').addEventListener('click', mfit);
+
+  const modal = document.getElementById('modal-{safe_key}');
+  modal.addEventListener('wheel', function(e) {{
+    if (getComputedStyle(modal).display === 'none') return;
+    e.preventDefault();
+    mzoom(e.deltaY < 0 ? 1.1 : 0.9, e.clientX, e.clientY);
+  }}, {{ passive: false }});
+
+  let mdragging = false, msx = 0, msy = 0, msl = 0, mst = 0;
+  modal.addEventListener('mousedown', function(e) {{
+    if (e.target.tagName === 'BUTTON') return;
+    mdragging = true; msx = e.clientX; msy = e.clientY; msl = window.scrollX; mst = window.scrollY;
+    modal.style.cursor = 'grabbing';
+  }});
+  window.addEventListener('mouseup', function() {{ mdragging = false; modal.style.cursor = 'grab'; }});
+  window.addEventListener('mousemove', function(e) {{
+    if (!mdragging) return;
+    window.scrollTo(msl - (e.clientX - msx), mst - (e.clientY - msy));
+  }});
+  // ESC 关闭
+  document.addEventListener('keydown', function(e) {{
+    if (e.key === 'Escape' && getComputedStyle(modal).display !== 'none') {{
+      modal.style.display = 'none';
+    }}
   }});
 
   // 初次渲染：有定位框则放大居中，否则自适应
