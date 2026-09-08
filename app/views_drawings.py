@@ -1063,11 +1063,16 @@ def _extract_labels_via_ocr(image_paths: list[Path]) -> tuple[list[dict], str | 
 
     import sys as _sys
     import json as _json
+    import os as _os
 
     # ocr_worker.py 在 src/ 下，与本文件 app/ 同级
     worker_script = Path(__file__).resolve().parent.parent / "src" / "ocr_worker.py"
     if not worker_script.exists():
         return empty, "OCR worker 脚本缺失（src/ocr_worker.py）"
+
+    # worker 解释器：默认与主程序相同；主环境 numpy 2.x 与 onnxruntime（glibc
+    # 限制升不了级）冲突时，可用独立 venv（numpy<2）并通过环境变量指过来
+    ocr_python = _os.environ.get("COSMOS_OCR_PYTHON", _sys.executable)
 
     timeout = max(60, len(image_paths) * 15)  # 每页最多 15 秒，保底 60 秒
 
@@ -1077,7 +1082,7 @@ def _extract_labels_via_ocr(image_paths: list[Path]) -> tuple[list[dict], str | 
 
     try:
         proc = subprocess.run(
-            [_sys.executable, str(worker_script)] + [str(p) for p in image_paths],
+            [ocr_python, str(worker_script)] + [str(p) for p in image_paths],
             capture_output=True,
             text=True,
             timeout=timeout,
