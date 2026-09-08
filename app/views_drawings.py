@@ -1004,11 +1004,19 @@ def _display_preview(project_id: int, doc: Document, width: int = 240):
         if pages:
             st.image(str(pages[0]), width=width, caption=f"CAD预览: {pages[0].name}")
         else:
+            # 没有预览就自动转换（优先 Jenkins，失败回退本地引擎）
             suffix = file_path.suffix.lower()
-            if suffix == ".dxf":
-                st.info("DXF 文件已上传，请在打开审核时等待渲染。")
+            with st.spinner("正在生成预览图（首次稍长，约 1-3 分钟）..."):
+                gen_pages, err = _convert_dwg_to_images(file_path, project_id, doc.id)
+            if gen_pages:
+                st.image(str(gen_pages[0]), width=width,
+                         caption=f"CAD预览: {gen_pages[0].name} ({len(gen_pages)} 页)")
             else:
-                st.info("DWG 文件预览需要系统安装 LibreOffice 或 ODA File Converter。文件已保存，可下载原文件。")
+                if suffix == ".dxf":
+                    st.info("DXF 文件已上传，预览生成失败。")
+                else:
+                    st.info(f"DWG 预览生成失败：{err or '未知原因'}\n\n"
+                            "文件已保存，可下载原文件。")
         return
 
     st.info("该文件类型暂不支持预览")
