@@ -29,8 +29,19 @@ from src.time_utils import beijing_timestamp, format_beijing, now_beijing, now_u
 
 # ============ session helpers ============
 def get_current_project() -> Project | None:
-    """从session获取当前选中的项目."""
+    """从session获取当前选中的项目.
+
+    未选中且只有一个可见项目时自动选中（用户点过"返回项目列表"则尊重其
+    选择，本次会话内不再自动选中）。
+    """
     pid = st.session_state.get("current_project_id")
+    if not pid:
+        user = current_user()
+        if user and not st.session_state.get("suppress_project_autoselect"):
+            projects = visible_projects(user["id"])
+            if len(projects) == 1:
+                pid = projects[0].id
+                st.session_state["current_project_id"] = pid
     if not pid:
         return None
     with session() as s:
@@ -93,7 +104,7 @@ def logout():
     if token:
         _revoke_auth_token(token)
         del st.query_params["token"]
-    for k in ("user", "current_project_id"):
+    for k in ("user", "current_project_id", "suppress_project_autoselect"):
         st.session_state.pop(k, None)
 
 
@@ -373,6 +384,8 @@ def view_projects():
     if st.session_state.get("current_project_id"):
         if st.button("← Back to projects list"):
             st.session_state.pop("current_project_id", None)
+            # 用户主动要看列表：本次会话内不再自动选中唯一项目
+            st.session_state["suppress_project_autoselect"] = True
             st.rerun()
         view_project_detail()
         return
@@ -397,6 +410,7 @@ def view_projects():
                 c2.caption(f"captures: {n_caps} · docs: {n_docs} · materials: {n_mats}")
                 if c3.button("Open", key=f"open_{p.id}", type="primary"):
                     st.session_state["current_project_id"] = p.id
+                    st.session_state.pop("suppress_project_autoselect", None)
                     st.rerun()
 
     st.divider()
@@ -420,6 +434,7 @@ def view_projects():
             project_dir(pid)
             st.success(f"Created project #{pid} '{name}'")
             st.session_state["current_project_id"] = pid
+            st.session_state.pop("suppress_project_autoselect", None)
             st.rerun()
 
 
