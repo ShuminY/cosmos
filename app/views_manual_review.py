@@ -41,6 +41,7 @@ from views_drawings import (
     _annotated_image_output_path,
     _render_shape_annotator,
     _comment_has_shapes,
+    _prepare_manual_marker_toggles,
     _export_manual_comments_xlsx,
     _export_manual_comments_bundle,
     _export_comment_annotated_pdf,
@@ -518,25 +519,37 @@ def _render_manual_review_workbench(doc: Document, project: Project):
             if manual_focus_bbox:
                 st.caption(f"🔍 已定位到人工批注位置，图片自动放大居中；点查看器内“复位”可看整页。")
 
-            # 人工批注位置：可勾选在图上显示/隐藏绿色标注图形（默认显示）
+            # 人工批注位置：可勾选在图上显示/隐藏绿色标注图形，
+            # 以及是否把批注正文当作标签画在框边（两者默认都开，可手动关掉）
             has_comment_shapes = any(_comment_has_shapes(c) for c in page_comments)
             show_markers = True
+            show_labels = False
             if has_comment_shapes:
-                show_markers = st.checkbox(
-                    "🟢 在图上显示人工批注标注",
-                    value=True,
-                    key=f"show_manual_markers_{doc.id}_{page_number}",
-                )
+                _prepare_manual_marker_toggles(doc.id, page_number)
+                cols_marker = st.columns([1, 1])
+                with cols_marker[0]:
+                    show_markers = st.checkbox(
+                        "🟢 在图上显示人工批注标注",
+                        key=f"show_manual_markers_{doc.id}_{page_number}",
+                    )
+                if show_markers:
+                    with cols_marker[1]:
+                        show_labels = st.checkbox(
+                            "📝 在框边显示批注文字",
+                            key=f"show_manual_labels_{doc.id}_{page_number}",
+                        )
 
             viewer_image = current_image
             manual_marked = 0
             if has_comment_shapes and show_markers:
+                from functools import partial
                 base_path = _annotated_image_output_path(doc.project_id, doc.id, current_image, selected_index)
-                manual_marker_path = base_path.with_name(base_path.stem + "_人工.png")
+                suffix = "_人工_标注.png" if show_labels else "_人工.png"
+                manual_marker_path = base_path.with_name(base_path.stem + suffix)
                 try:
                     viewer_image, manual_marked = _cached_marker_image(
                         current_image, page_comments, manual_marker_path,
-                        _build_manual_comment_marker_image,
+                        partial(_build_manual_comment_marker_image, show_labels=show_labels),
                     )
                 except Exception:
                     viewer_image, manual_marked = current_image, 0

@@ -1975,6 +1975,43 @@ def _comment_has_shapes(comment: dict) -> bool:
     return bool(_comment_shapes(comment))
 
 
+def _manual_marker_keys(doc_id: int, page_number: int) -> tuple[str, str, str]:
+    """人工批注标注开关的 session_state key：(显示图形, 显示文字, 强制勾选请求)。"""
+    return (
+        f"show_manual_markers_{doc_id}_{page_number}",
+        f"show_manual_labels_{doc_id}_{page_number}",
+        f"force_manual_labels_{doc_id}_{page_number}",
+    )
+
+
+def _request_manual_labels(doc_id: int, page_number: int):
+    """请求下一次渲染时自动勾选“显示标注 + 框边显示文字”。
+
+    不能在这里直接写 checkbox 的 widget key —— 左栏的 checkbox 在本次脚本运行中
+    已经实例化，Streamlit 会抛异常。所以先落一个 pending 标记，由 checkbox 渲染
+    前的 _prepare_manual_marker_toggles 消费。
+    """
+    _, _, force_key = _manual_marker_keys(doc_id, page_number)
+    st.session_state[force_key] = True
+
+
+def _prepare_manual_marker_toggles(doc_id: int, page_number: int):
+    """在两个 checkbox 实例化之前准备 session_state。
+
+    1. 播种默认值（显示图形=开、框边文字=开）；checkbox 因此不能再传 value=，
+       否则 Streamlit 会警告“created with a default value but also had its
+       value set via the Session State API”。
+    2. 消费“查看位置”留下的 pending 标记，把两个开关都置为勾选（用户手动关过之后
+       再点“查看位置”，仍然要能自动打开）。
+    """
+    markers_key, labels_key, force_key = _manual_marker_keys(doc_id, page_number)
+    st.session_state.setdefault(markers_key, True)
+    st.session_state.setdefault(labels_key, True)
+    if st.session_state.pop(force_key, False):
+        st.session_state[markers_key] = True
+        st.session_state[labels_key] = True
+
+
 def _build_review_marker_image(image_path: Path, page_items: list[dict], output_path: Path) -> tuple[Path, int]:
     """在原图上按“坐标”字段绘制编号方框/圆点，编号与右侧系统审核列表一致。
 
@@ -2017,11 +2054,13 @@ def _build_review_marker_image(image_path: Path, page_items: list[dict], output_
     return output_path, marked
 
 
-def _build_manual_comment_marker_image(image_path: Path, page_comments: list[dict], output_path: Path) -> tuple[Path, int]:
+def _build_manual_comment_marker_image(image_path: Path, page_comments: list[dict], output_path: Path,
+                                       show_labels: bool = False) -> tuple[Path, int]:
     """在原图上绘制人工批注的标注图形（绿色）与序号徽标，序号与右侧批注列表一致。
 
     支持的图形：矩形框(rect)、圆形/椭圆(circle)、箭头(arrow)、文字(text)。
     兼容仅有旧 bbox 字段的历史批注（视为一个矩形）。
+    show_labels=True 时在框边显示批注的问题描述/建议方案文字。
     返回 (输出图路径, 已标注批注数)。无任何图形时返回原图路径，标注数为 0。
     """
     import math
@@ -2030,7 +2069,7 @@ def _build_manual_comment_marker_image(image_path: Path, page_comments: list[dic
     for idx, comment in enumerate(page_comments, start=1):
         shapes = _comment_shapes(comment)
         if shapes:
-            marked_comments.append((idx, shapes))
+            marked_comments.append((idx, shapes, comment))
     if not marked_comments:
         return image_path, 0
 
@@ -2060,10 +2099,68 @@ def _build_manual_comment_marker_image(image_path: Path, page_comments: list[dic
         num_w, num_h = _text_size(draw, num, badge_font)
         draw.text((bx - num_w / 2, by - num_h / 2 - 1), num, fill="white", font=badge_font)
 
-    for idx, shapes in marked_comments:
+    # 批注文字标签：白底绿框，画在图形右侧（右侧空间不足则改到左侧），
+    # 并从图形边缘拉一条细引线指向标签，避免多个标签互相错位时看不出归属。
+    label_font = _load_annotation_font(max(20, round(min(width, height) / 65)))
+    label_max_w = max(200, round(width * 0.22))      # 标签最大宽度，超出则换行
+    label_pad = max(6, line_w * 3)
+    label_gap = max(10, round(min(width, height) / 110))  # 图形与标签的水平间距
+    occupied: list[tuple[float, float, float, float]] = []  # 已放置标签，用于避让
+
+    def _label_lines(comment: dict, num: str) -> list[str]:
+        """组装标签文本：序号 + 问题描述 + 建议方案（各自截断，避免糊满图纸）。"""
+        problem, suggestion = _comment_display_parts(comment)
+        out: list[str] = []
+        for prefix, body in (("问题", problem), ("建议", suggestion)):
+            if not body:
+                continue
+            if len(body) > 60:
+                body = body[:60] + "…"
+            out.extend(_wrap_text_for_draw(draw, f"{prefix}：{body}", label_font, label_max_w))
+        if not out:
+            return []
+        return [f"#{num}"] + out
+
+    def _place_label(lines: list[str], sx1, sy1, sx2, sy2):
+        """在图形旁边画标签框；返回实际绘制的矩形，供后续避让。"""
+        line_h = max(_text_size(draw, ln or "国", label_font)[1] for ln in lines) + 4
+        box_w = max(_text_size(draw, ln, label_font)[0] for ln in lines) + label_pad * 2
+        box_h = line_h * len(lines) + label_pad * 2
+
+        # 优先放右侧，放不下改左侧，都放不下就压在图形内右上角
+        lx = sx2 + label_gap
+        if lx + box_w > width:
+            lx = sx1 - label_gap - box_w
+        if lx < 0:
+            lx = min(sx1, width - box_w)
+        ly = sy1
+        # 竖直方向避让已有标签，逐步下移
+        for _ in range(40):
+            rect = (lx, ly, lx + box_w, ly + box_h)
+            if not any(not (rect[2] < o[0] or rect[0] > o[2]
+                            or rect[3] < o[1] or rect[1] > o[3]) for o in occupied):
+                break
+            ly += line_h
+        ly = max(0, min(ly, height - box_h))
+        lx = max(0, min(lx, width - box_w))
+
+        # 引线：从图形边缘中点连到标签左（或右）边中点
+        anchor_x = sx2 if lx >= sx2 else sx1
+        draw.line([anchor_x, (sy1 + sy2) / 2,
+                   lx if lx >= sx2 else lx + box_w, ly + box_h / 2],
+                  fill=color, width=max(1, line_w // 2))
+        draw.rectangle([lx, ly, lx + box_w, ly + box_h],
+                       fill=(255, 255, 255, 240), outline=color, width=line_w)
+        for i, ln in enumerate(lines):
+            draw.text((lx + label_pad, ly + label_pad + i * line_h),
+                      ln, fill=(21, 94, 51), font=label_font)
+        occupied.append((lx, ly, lx + box_w, ly + box_h))
+
+    for idx, shapes, comment in marked_comments:
         num = str(idx)
         # 徽标锚点：取该批注第一个图形的左上/起点
         anchor = None
+        bounds = None  # (x1,y1,x2,y2) 图形像素边界，用于标签定位
         for sp in shapes:
             stype = sp.get("type")
             if stype == "rect" and isinstance(sp.get("bbox"), (list, tuple)):
@@ -2072,12 +2169,22 @@ def _build_manual_comment_marker_image(image_path: Path, page_comments: list[dic
                 draw.rectangle([px1, py1, px2, py2], fill=fill, outline=color, width=line_w)
                 if anchor is None:
                     anchor = (px1, py1)
+                if bounds is None:
+                    bounds = (px1, py1, px2, py2)
+                else:
+                    bounds = (min(bounds[0], px1), min(bounds[1], py1),
+                              max(bounds[2], px2), max(bounds[3], py2))
             elif stype == "circle" and isinstance(sp.get("bbox"), (list, tuple)):
                 x1, y1, x2, y2 = sp["bbox"]
                 px1, py1, px2, py2 = _clampx(x1), _clampy(y1), _clampx(x2), _clampy(y2)
                 draw.ellipse([px1, py1, px2, py2], fill=fill, outline=color, width=line_w)
                 if anchor is None:
                     anchor = (px1, py1)
+                if bounds is None:
+                    bounds = (px1, py1, px2, py2)
+                else:
+                    bounds = (min(bounds[0], px1), min(bounds[1], py1),
+                              max(bounds[2], px2), max(bounds[3], py2))
             elif stype == "arrow" and isinstance(sp.get("points"), (list, tuple)):
                 sx, sy, ex, ey = sp["points"]
                 psx, psy, pex, pey = _clampx(sx), _clampy(sy), _clampx(ex), _clampy(ey)
@@ -2092,6 +2199,13 @@ def _build_manual_comment_marker_image(image_path: Path, page_comments: list[dic
                     draw.line([pex, pey, hx, hy], fill=color, width=line_w)
                 if anchor is None:
                     anchor = (psx, psy)
+                _ax1, _ax2 = min(psx, pex), max(psx, pex)
+                _ay1, _ay2 = min(psy, pey), max(psy, pey)
+                if bounds is None:
+                    bounds = (_ax1, _ay1, _ax2, _ay2)
+                else:
+                    bounds = (min(bounds[0], _ax1), min(bounds[1], _ay1),
+                              max(bounds[2], _ax2), max(bounds[3], _ay2))
             elif stype == "text" and isinstance(sp.get("point"), (list, tuple)):
                 px, py = _clampx(sp["point"][0]), _clampy(sp["point"][1])
                 label = str(sp.get("text", "")).strip()
@@ -2106,8 +2220,15 @@ def _build_manual_comment_marker_image(image_path: Path, page_comments: list[dic
                     draw.text((px + pad, py + pad), label, fill=color, font=text_font)
                 if anchor is None:
                     anchor = (px, py)
+                if bounds is None:
+                    bounds = (px, py, px, py)
         if anchor is not None:
             _badge(anchor[0], anchor[1], num)
+        # 在框边展示批注正文（问题/建议），让图上可直接读到内容
+        if show_labels and bounds is not None:
+            _lines = _label_lines(comment, num)
+            if _lines:
+                _place_label(_lines, *bounds)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     base_img.save(output_path, format="PNG")
@@ -2882,25 +3003,36 @@ def _render_review_legend_images(doc: Document, review_items: list[dict], analys
         elif not CANVAS_AVAILABLE:
             st.caption("❌ `streamlit-drawable-canvas` 未安装，请先执行：`pip install streamlit-drawable-canvas`")
 
-        # 人工批注位置：可勾选在图上显示/隐藏绿色标注图形（默认显示）
+        # 人工批注位置：可勾选在图上显示/隐藏绿色标注图形与框边批注文字（默认都开）
         has_comment_shapes = any(_comment_has_shapes(c) for c in page_comments)
         show_markers = True
+        show_labels = False
         if has_comment_shapes:
-            show_markers = st.checkbox(
-                "🟢 在图上显示人工批注标注",
-                value=True,
-                key=f"show_manual_markers_{doc.id}_{page_number}",
-            )
+            _prepare_manual_marker_toggles(doc.id, page_number)
+            cols_marker = st.columns([1, 1])
+            with cols_marker[0]:
+                show_markers = st.checkbox(
+                    "🟢 在图上显示人工批注标注",
+                    key=f"show_manual_markers_{doc.id}_{page_number}",
+                )
+            if show_markers:
+                with cols_marker[1]:
+                    show_labels = st.checkbox(
+                        "📝 在框边显示批注文字",
+                        key=f"show_manual_labels_{doc.id}_{page_number}",
+                    )
 
         viewer_image = display_image
         manual_marked = 0
         if has_comment_shapes and show_markers:
+            from functools import partial
             base_marker = _annotated_image_output_path(doc.project_id, doc.id, current_image, selected_index)
-            manual_marker_path = base_marker.with_name(base_marker.stem + "_人工.png")
+            suffix = "_人工_标注.png" if show_labels else "_人工.png"
+            manual_marker_path = base_marker.with_name(base_marker.stem + suffix)
             try:
                 viewer_image, manual_marked = _cached_marker_image(
                     display_image, page_comments, manual_marker_path,
-                    _build_manual_comment_marker_image,
+                    partial(_build_manual_comment_marker_image, show_labels=show_labels),
                 )
             except Exception:
                 viewer_image, manual_marked = display_image, 0
@@ -3185,6 +3317,8 @@ def _render_manual_comments_ui(doc: Document, page_number: int, page_comments: l
                                     st.session_state.pop(manual_focus_key, None)
                                 else:
                                     st.session_state[manual_focus_key] = comment_id
+                                    # 定位到某条批注时，顺手把批注文字标签打开，免得还要手动勾
+                                    _request_manual_labels(doc.id, page_number)
                                 st.rerun()
                         else:
                             c1, c2 = st.columns(2)
@@ -4865,13 +4999,19 @@ def view_drawing_analysis(project: Project | None):
         st.warning("请先选择一个项目")
         return
 
-    tab1, tab2, tab3 = st.tabs(["📋 历史分析", "🔍 新增分析", "💬 继续问答"])
-
-    with tab1:
-        view_drawing_analysis_history(project)
-
-    with tab2:
-        view_new_drawing_analysis(project)
-
-    with tab3:
-        view_drawing_analysis_chat(project)
+    # 用 segmented_control 而不是 st.tabs：st.tabs 是前端 CSS 显隐，后端每次
+    # rerun 都会把三个页面的函数体全部执行一遍（历史页循环所有图纸建 expander、
+    # 问答页渲染整个会话的图片）。上传文件会触发 rerun，这些无关开销会算进
+    # 上传的等待时间里。这里只渲染当前选中的那一个。
+    views = {
+        "📋 历史分析": view_drawing_analysis_history,
+        "🔍 新增分析": view_new_drawing_analysis,
+        "💬 继续问答": view_drawing_analysis_chat,
+    }
+    labels = list(views)
+    choice = st.segmented_control(
+        "视图", labels, default=labels[0],
+        key=f"drawing_analysis_view_{project.id}",
+        label_visibility="collapsed",
+    ) or labels[0]
+    views[choice](project)
