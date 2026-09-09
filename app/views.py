@@ -87,6 +87,16 @@ def _revoke_auth_token(token: str):
         set_setting("auth_tokens", tokens)
 
 
+def logout():
+    """登出：吊销保持登录 token、清 URL、清 session。调用方负责 st.rerun()。"""
+    token = st.query_params.get("token")
+    if token:
+        _revoke_auth_token(token)
+        del st.query_params["token"]
+    for k in ("user", "current_project_id"):
+        st.session_state.pop(k, None)
+
+
 def _try_token_login():
     """URL 里有 token 且有效则恢复登录态；无效/过期则从 URL 清掉。"""
     token = st.query_params.get("token")
@@ -274,12 +284,7 @@ def view_profile():
 
     st.divider()
     if st.button("Log out", type="secondary"):
-        token = st.query_params.get("token")
-        if token:
-            _revoke_auth_token(token)
-            del st.query_params["token"]
-        for k in ("user", "current_project_id"):
-            st.session_state.pop(k, None)
+        logout()
         st.rerun()
 
 

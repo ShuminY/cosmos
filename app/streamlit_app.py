@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from views import (
     view_login, view_profile, view_admin_users,
     view_projects, view_project_detail, get_current_project,
-    current_user, is_admin, require_login,
+    current_user, is_admin, require_login, logout,
 )
 from views_kb import view_knowledge_base, view_chatbot, view_chat_image, view_llm_settings
 from views_tasks import view_task_tracking
@@ -152,17 +152,15 @@ def set_decision(instance_id: str, decision: str, sku: str | None = None):
 
 
 # ============ auth gate ============
-if not current_user():
-    view_login()
-    st.stop()
+# require_login 内部会先尝试用 URL 里的 token 恢复登录态（刷新不掉线）
+require_login()
 
 # ============ sidebar nav ============
 u = current_user()
 st.sidebar.title("Cosmos POC")
 st.sidebar.markdown(f"**{u['name']}** · `{u['role']}`")
 if st.sidebar.button("Log out"):
-    st.session_state.pop("user", None)
-    st.session_state.pop("current_project_id", None)
+    logout()
     st.rerun()
 st.sidebar.divider()
 
