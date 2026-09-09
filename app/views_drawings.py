@@ -3514,7 +3514,7 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
     <span id="pct-{safe_key}" style="color:#6b7280; font-size:0.9rem;">100%</span>
   </div>
   <div id="frame-{safe_key}" style="border:1px solid #e5e7eb; border-radius:8px; background:#f9fafb; overflow:auto; max-height:864px; cursor:grab; position:relative;">
-    <img id="img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px;" />
+    <img id="img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px; filter:contrast(1.2) brightness(1.05);" />
   </div>
 </div>
 <script>

@@ -1437,6 +1437,7 @@ def _render_panzoom_iframe(image_path: Path, key: str, height: int = 600) -> Non
   #pz-{key} img {{
     display: block; transform-origin: 0 0; will-change: transform;
     max-width: none; max-height: none; image-rendering: -webkit-optimize-contrast;
+    filter: contrast(1.2) brightness(1.05);
   }}
   .pz-ctrl {{
     position: absolute; bottom: 12px; right: 12px;
