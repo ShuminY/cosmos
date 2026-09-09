@@ -3516,18 +3516,6 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
   <div id="frame-{safe_key}" style="border:1px solid #e5e7eb; border-radius:8px; background:#f9fafb; overflow:auto; max-height:864px; cursor:grab; position:relative;">
     <img id="img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px;" />
   </div>
-  <!-- 全屏查看原图覆盖层，避免 data: URL 太长导致 window.open 失败 -->
-  <div id="modal-{safe_key}" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:99999; overflow:auto; cursor:grab;">
-    <div style="position:sticky; top:8px; left:8px; z-index:10; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-      <button id="modal-close-{safe_key}" style="padding:0.4rem 0.8rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">✕ 关闭</button>
-      <button id="modal-zoomout-{safe_key}" style="padding:0.4rem 0.8rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">➖</button>
-      <button id="modal-zoomin-{safe_key}" style="padding:0.4rem 0.8rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">➕</button>
-      <button id="modal-reset-{safe_key}" style="padding:0.4rem 0.8rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer;">复位</button>
-      <span id="modal-pct-{safe_key}" style="color:#fff; font-size:0.9rem; text-shadow:0 0 4px #000;">100%</span>
-      <span style="color:#d1d5db; font-size:0.85rem; margin-left:auto; margin-right:12px;">原始 {width} × {height}px · 滚轮缩放 · 拖动查看</span>
-    </div>
-    <img id="modal-img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px; margin:8px;" />
-  </div>
 </div>
 <script>
 (function() {{
@@ -3621,75 +3609,86 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
     frame.scrollTop = stp - (e.clientY - sy);
   }});
 
+  // 查看原图：把独立查看器页面打成 Blob 在新标签页打开。
+  // （不直接用 data: URL 跳转——太长会被浏览器拒开新页；Blob URL 没有长度问题）
   document.getElementById('open-{safe_key}').addEventListener('click', function() {{
-    const modal = document.getElementById('modal-{safe_key}');
-    modal.style.display = 'block';
-    // 打开时先自适应宽度
-    const mImg = document.getElementById('modal-img-{safe_key}');
-    const avail = window.innerWidth - 16;
-    let s = Math.min(1, avail / baseW);
-    mscale = s;
-    mImg.style.width = (baseW * s) + 'px';
-    mImg.style.height = (baseH * s) + 'px';
-    document.getElementById('modal-pct-{safe_key}').textContent = Math.round(s * 100) + '%';
-    window.scrollTo(0, 0);
-  }});
-
-  // 全屏覆盖层交互
-  const mImg = document.getElementById('modal-img-{safe_key}');
-  const mPct = document.getElementById('modal-pct-{safe_key}');
-  let mscale = 1;
-  function mapply() {{
-    mImg.style.width = (baseW * mscale) + 'px';
-    mImg.style.height = (baseH * mscale) + 'px';
-    mPct.textContent = Math.round(mscale * 100) + '%';
+    const src = document.getElementById('img-{safe_key}').src;
+    const page = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{caption} - 原图查看</title>
+<style>
+  body {{ margin:0; background:#1f2937; font-family:sans-serif; overflow:hidden; }}
+  #bar {{ position:fixed; top:8px; left:8px; z-index:10; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
+  #bar button {{ padding:0.4rem 0.8rem; border:1px solid #d1d5db; border-radius:0.5rem; background:#fff; cursor:pointer; }}
+  #pct {{ color:#fff; font-size:0.9rem; text-shadow:0 0 4px #000; }}
+  #hint {{ color:#d1d5db; font-size:0.85rem; }}
+  #view {{ position:absolute; inset:0; overflow:auto; cursor:grab; }}
+  #vimg {{ display:block; transform-origin:top left; margin:56px 8px 8px; }}
+</style></head><body>
+  <div id="bar">
+    <button id="zoomout">➖</button>
+    <button id="zoomin">➕</button>
+    <button id="reset">复位</button>
+    <span id="pct">100%</span>
+    <span id="hint">原始 {width} × {height}px · 滚轮缩放 · 拖动查看</span>
+  </div>
+  <div id="view"><img id="vimg" src="${{src}}"></div>
+<script>
+(function() {{
+  const baseW = {width}, baseH = {height};
+  const view = document.getElementById('view');
+  const img = document.getElementById('vimg');
+  const pct = document.getElementById('pct');
+  let scale = 1;
+  function apply() {{
+    img.style.width = (baseW * scale) + 'px';
+    img.style.height = (baseH * scale) + 'px';
+    pct.textContent = Math.round(scale * 100) + '%';
   }}
-  function mzoom(factor, centerX, centerY) {{
-    const oldScale = mscale;
-    const newScale = Math.min(8, Math.max(0.05, mscale * factor));
+  function zoom(factor, centerX, centerY) {{
+    const oldScale = scale;
+    const newScale = Math.min(8, Math.max(0.05, scale * factor));
     if (newScale === oldScale) return;
-    const cxImg = window.scrollX + centerX;
-    const cyImg = window.scrollY + centerY;
-    mscale = newScale;
-    mapply();
+    const cxImg = view.scrollLeft + centerX;
+    const cyImg = view.scrollTop + centerY;
+    scale = newScale;
+    apply();
     const ratio = newScale / oldScale;
-    window.scrollTo(Math.max(0, cxImg * ratio - centerX), Math.max(0, cyImg * ratio - centerY));
+    view.scrollLeft = Math.max(0, cxImg * ratio - centerX);
+    view.scrollTop = Math.max(0, cyImg * ratio - centerY);
   }}
-  function mfit() {{
-    const avail = window.innerWidth - 16;
-    mscale = Math.min(1, avail / baseW);
-    mapply();
+  function fit() {{
+    scale = Math.min(1, (window.innerWidth - 24) / baseW);
+    apply();
   }}
-  document.getElementById('modal-close-{safe_key}').addEventListener('click', function() {{
-    document.getElementById('modal-{safe_key}').style.display = 'none';
-  }});
-  document.getElementById('modal-zoomin-{safe_key}').addEventListener('click', () => mzoom(1.25, window.innerWidth/2, window.innerHeight/2));
-  document.getElementById('modal-zoomout-{safe_key}').addEventListener('click', () => mzoom(0.8, window.innerWidth/2, window.innerHeight/2));
-  document.getElementById('modal-reset-{safe_key}').addEventListener('click', mfit);
-
-  const modal = document.getElementById('modal-{safe_key}');
-  modal.addEventListener('wheel', function(e) {{
-    if (getComputedStyle(modal).display === 'none') return;
+  document.getElementById('zoomin').addEventListener('click', () => zoom(1.25, window.innerWidth/2, window.innerHeight/2));
+  document.getElementById('zoomout').addEventListener('click', () => zoom(0.8, window.innerWidth/2, window.innerHeight/2));
+  document.getElementById('reset').addEventListener('click', fit);
+  view.addEventListener('wheel', function(e) {{
     e.preventDefault();
-    mzoom(e.deltaY < 0 ? 1.1 : 0.9, e.clientX, e.clientY);
+    const rect = view.getBoundingClientRect();
+    zoom(e.deltaY < 0 ? 1.1 : 0.9, e.clientX - rect.left, e.clientY - rect.top);
   }}, {{ passive: false }});
-
-  let mdragging = false, msx = 0, msy = 0, msl = 0, mst = 0;
-  modal.addEventListener('mousedown', function(e) {{
-    if (e.target.tagName === 'BUTTON') return;
-    mdragging = true; msx = e.clientX; msy = e.clientY; msl = window.scrollX; mst = window.scrollY;
-    modal.style.cursor = 'grabbing';
+  let dragging = false, sx = 0, sy = 0, sl = 0, st = 0;
+  view.addEventListener('mousedown', function(e) {{
+    dragging = true; sx = e.clientX; sy = e.clientY; sl = view.scrollLeft; st = view.scrollTop;
+    view.style.cursor = 'grabbing';
   }});
-  window.addEventListener('mouseup', function() {{ mdragging = false; modal.style.cursor = 'grab'; }});
+  window.addEventListener('mouseup', function() {{ dragging = false; view.style.cursor = 'grab'; }});
   window.addEventListener('mousemove', function(e) {{
-    if (!mdragging) return;
-    window.scrollTo(msl - (e.clientX - msx), mst - (e.clientY - msy));
+    if (!dragging) return;
+    view.scrollLeft = sl - (e.clientX - sx);
+    view.scrollTop = st - (e.clientY - sy);
   }});
-  // ESC 关闭
   document.addEventListener('keydown', function(e) {{
-    if (e.key === 'Escape' && getComputedStyle(modal).display !== 'none') {{
-      modal.style.display = 'none';
-    }}
+    if (e.key === '+' || e.key === '=') zoom(1.25, window.innerWidth/2, window.innerHeight/2);
+    if (e.key === '-') zoom(0.8, window.innerWidth/2, window.innerHeight/2);
+    if (e.key === '0') fit();
+  }});
+  fit();
+}})();
+<\\/script></body></html>`;
+    const blob = new Blob([page], {{ type: 'text/html' }});
+    window.open(URL.createObjectURL(blob), '_blank');
   }});
 
   // 初次渲染：有定位框则放大居中，否则自适应

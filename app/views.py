@@ -4,6 +4,7 @@ Imported by streamlit_app.py — each function renders one page.
 """
 from __future__ import annotations
 import json
+import secrets
 import shutil
 import sys
 import time
@@ -40,7 +41,67 @@ def current_user() -> dict | None:
     return st.session_state.get("user")
 
 
+# ============ 登录保持（刷新不掉线） ============
+# 登录成功后签发一个 token 写进 URL query param（?token=...），刷新页面时
+# URL 不变，凭 token 自动恢复登录态。token 存 settings.json，7 天过期。
+_AUTH_TOKEN_TTL_SECONDS = 7 * 86400
+
+
+def _auth_tokens() -> dict:
+    """读取 token 表并惰性清理过期项。格式 {token: {"user_id": int, "expires": ts}}"""
+    tokens = get_setting("auth_tokens", {}) or {}
+    if not isinstance(tokens, dict):
+        return {}
+    now = time.time()
+    valid = {t: v for t, v in tokens.items()
+             if isinstance(v, dict) and v.get("expires", 0) > now}
+    if len(valid) != len(tokens):
+        set_setting("auth_tokens", valid)
+    return valid
+
+
+def _issue_auth_token(user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    tokens = _auth_tokens()
+    tokens[token] = {"user_id": user_id,
+                     "expires": time.time() + _AUTH_TOKEN_TTL_SECONDS}
+    set_setting("auth_tokens", tokens)
+    return token
+
+
+def _resolve_auth_token(token: str) -> dict | None:
+    info = _auth_tokens().get(token)
+    if not info:
+        return None
+    with session() as s:
+        u = s.get(User, info.get("user_id"))
+        if not u or not u.is_active:
+            return None
+        return {"id": u.id, "email": u.email, "name": u.name, "role": u.role}
+
+
+def _revoke_auth_token(token: str):
+    tokens = _auth_tokens()
+    if token in tokens:
+        del tokens[token]
+        set_setting("auth_tokens", tokens)
+
+
+def _try_token_login():
+    """URL 里有 token 且有效则恢复登录态；无效/过期则从 URL 清掉。"""
+    token = st.query_params.get("token")
+    if not token:
+        return
+    user = _resolve_auth_token(token)
+    if user:
+        st.session_state["user"] = user
+    else:
+        del st.query_params["token"]
+
+
 def require_login():
+    if not current_user():
+        _try_token_login()
     if not current_user():
         view_login()
         st.stop()
@@ -97,6 +158,8 @@ def view_login():
             st.session_state["user"] = {
                 "id": u.id, "email": u.email, "name": u.name, "role": u.role,
             }
+            # 签发保持登录 token（刷新页面凭 URL 里的 token 自动登录）
+            st.query_params["token"] = _issue_auth_token(u.id)
             st.session_state.pop("auth_mode", None)
             # 只有一个可见项目时，登录后自动选中，省去手动切换
             projects = visible_projects(u.id)
@@ -158,6 +221,7 @@ def view_register():
             return
         # Auto-login on success
         st.session_state["user"] = {"id": u.id, "email": u.email, "name": u.name, "role": u.role}
+        st.query_params["token"] = _issue_auth_token(u.id)
         st.session_state.pop("auth_mode", None)
         st.success(f"Welcome, {u.name}! You're signed in.")
         time.sleep(0.5)
@@ -207,6 +271,16 @@ def view_profile():
         else:
             update_password(u["id"], new)
             st.success("Password changed.")
+
+    st.divider()
+    if st.button("Log out", type="secondary"):
+        token = st.query_params.get("token")
+        if token:
+            _revoke_auth_token(token)
+            del st.query_params["token"]
+        for k in ("user", "current_project_id"):
+            st.session_state.pop(k, None)
+        st.rerun()
 
 
 # ============ Admin · Users ============
