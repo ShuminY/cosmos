@@ -1437,7 +1437,7 @@ def _render_panzoom_iframe(image_path: Path, key: str, height: int = 600) -> Non
   #pz-{key} img {{
     display: block; transform-origin: 0 0; will-change: transform;
     max-width: none; max-height: none; image-rendering: -webkit-optimize-contrast;
-    filter: contrast(1.35) brightness(0.92) saturate(1.15);
+    filter: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIGhlaWdodD0nMCcgd2lkdGg9JzAnPgo8ZmlsdGVyIGlkPSdnJyBjb2xvci1pbnRlcnBvbGF0aW9uLWZpbHRlcnM9J3NSR0InPgo8ZmVDb21wb25lbnRUcmFuc2Zlcj4KPGZlRnVuY1IgdHlwZT0nZ2FtbWEnIGFtcGxpdHVkZT0nMScgZXhwb25lbnQ9JzMuNicgb2Zmc2V0PScwJy8+CjxmZUZ1bmNHIHR5cGU9J2dhbW1hJyBhbXBsaXR1ZGU9JzEnIGV4cG9uZW50PSczLjYnIG9mZnNldD0nMCcvPgo8ZmVGdW5jQiB0eXBlPSdnYW1tYScgYW1wbGl0dWRlPScxJyBleHBvbmVudD0nMy42JyBvZmZzZXQ9JzAnLz4KPC9mZUNvbXBvbmVudFRyYW5zZmVyPgo8L2ZpbHRlcj48L3N2Zz4=#g");
   }}
   .pz-ctrl {{
     position: absolute; bottom: 12px; right: 12px;

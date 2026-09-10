@@ -3648,7 +3648,7 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
     <span id="pct-{safe_key}" style="color:#6b7280; font-size:0.9rem;">100%</span>
   </div>
   <div id="frame-{safe_key}" style="border:1px solid #e5e7eb; border-radius:8px; background:#f9fafb; overflow:auto; max-height:864px; cursor:grab; position:relative;">
-    <img id="img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px; filter:contrast(1.35) brightness(0.92) saturate(1.15);" />
+    <img id="img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px; filter:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIGhlaWdodD0nMCcgd2lkdGg9JzAnPgo8ZmlsdGVyIGlkPSdnJyBjb2xvci1pbnRlcnBvbGF0aW9uLWZpbHRlcnM9J3NSR0InPgo8ZmVDb21wb25lbnRUcmFuc2Zlcj4KPGZlRnVuY1IgdHlwZT0nZ2FtbWEnIGFtcGxpdHVkZT0nMScgZXhwb25lbnQ9JzMuNicgb2Zmc2V0PScwJy8+CjxmZUZ1bmNHIHR5cGU9J2dhbW1hJyBhbXBsaXR1ZGU9JzEnIGV4cG9uZW50PSczLjYnIG9mZnNldD0nMCcvPgo8ZmVGdW5jQiB0eXBlPSdnYW1tYScgYW1wbGl0dWRlPScxJyBleHBvbmVudD0nMy42JyBvZmZzZXQ9JzAnLz4KPC9mZUNvbXBvbmVudFRyYW5zZmVyPgo8L2ZpbHRlcj48L3N2Zz4=#g");" />
   </div>
 </div>
 <script>
