@@ -2037,7 +2037,7 @@ def _build_review_marker_image(image_path: Path, page_items: list[dict], output_
         color = _review_severity_color(item.get("严重程度", ""))
 
         # 半透明填充 + 实线边框
-        draw.rectangle([px1, py1, px2, py2], fill=color + (46,), outline=color, width=line_w)
+        draw.rectangle([px1, py1, px2, py2], fill=color + (80,), outline=color, width=line_w)
 
         # 左上角编号徽标
         bx, by = px1, py1
@@ -2078,12 +2078,12 @@ def _build_manual_comment_marker_image(image_path: Path, page_comments: list[dic
 
     width, height = base_img.size
     draw = ImageDraw.Draw(base_img, "RGBA")
-    line_w = max(2, round(min(width, height) / 400))
+    line_w = max(3, round(min(width, height) / 300))
     badge_r = max(12, round(min(width, height) / 90))
     badge_font = _load_annotation_font(max(16, round(min(width, height) / 70)))
     text_font = _load_annotation_font(max(18, round(min(width, height) / 60)))
-    color = (22, 163, 74)  # 绿色，与画框选区色调一致
-    fill = color + (46,)
+    color = (13, 122, 53)  # 深绿，与画框选区同色系但更沉，避免在浅色图纸上发飘
+    fill = color + (80,)
 
     def _clampx(v):
         return max(0.0, min(1.0, v)) * width
@@ -3648,7 +3648,7 @@ def _render_full_resolution_image(image_path: Path, caption: str, key: str,
     <span id="pct-{safe_key}" style="color:#6b7280; font-size:0.9rem;">100%</span>
   </div>
   <div id="frame-{safe_key}" style="border:1px solid #e5e7eb; border-radius:8px; background:#f9fafb; overflow:auto; max-height:864px; cursor:grab; position:relative;">
-    <img id="img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px; filter:contrast(1.2) brightness(1.05);" />
+    <img id="img-{safe_key}" src="data:image/png;base64,{data}" style="display:block; transform-origin:top left; width:{width}px; height:{height}px; filter:contrast(1.35) brightness(0.92) saturate(1.15);" />
   </div>
 </div>
 <script>
